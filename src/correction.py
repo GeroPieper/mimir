@@ -979,7 +979,7 @@ if __name__ == "__main__":
     # store results for detailed analysis
     dataset_analysis = True
 
-    dataset_name = "restaurant"
+    dataset_name = "beers"
     error_class = "simple_mcar"
     error_fraction = 3
     version = 1
@@ -1002,7 +1002,8 @@ if __name__ == "__main__":
     pdep_features = ['pr']
     test_synth_data_direction = 'user_data'
     #llm_name_corrfm = "gpt-4-turbo"  # only use this for tax, because experiments get expensive :)
-    llm_name_corrfm = "gpt-3.5-turbo"
+    # llm_name_corrfm = "gpt-3.5-turbo"
+    llm_name_corrfm = "mistral-7b-instruct-v0.2.Q4_0.gguf"
     sampling_technique = 'greedy'
 
     # Set this parameter to keep runtimes low when debugging

@@ -1,6 +1,7 @@
 name: mimir
 channels:
   - conda-forge
+  - huggingface
 dependencies:
   - autogluon=0.8.2
   - autogluon.common=0.8.2
