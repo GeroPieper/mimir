@@ -1,21 +1,22 @@
 import os
 import json
-import time
+# import time
 import random
 import sqlite3
 import numpy as np
 from typing import Union, Dict, Tuple, List
 from dataclasses import dataclass
 from collections import defaultdict
+
 from gpt4all import GPT4All
 
-import openai
+# import openai
 import pandas as pd
-import dotenv
+# import dotenv
+from sympy import false
 
-
-dotenv.load_dotenv()
-openai.api_key = os.environ.get('OPENAI_API_KEY')
+# dotenv.load_dotenv()
+# openai.api_key = os.environ.get('OPENAI_API_KEY')
 
 @dataclass
 class LLMRequest:
@@ -220,7 +221,7 @@ def fetch_llm(prompt: Union[str, None],
               version: Union[None, int] = None,
               error_class: Union[None, str] = None,
               #llm_name: str = "gpt-3.5-turbo"
-              llm_name: str = "mistral-7b-instruct-v0.2.Q4_0.gguf"
+              llm_name: str = "Meta-Llama-3-8B-Instruct.Q4_0.gguf"
               ) -> Union[LLMResult, None]:
     """
     Überarbeitung von fetch_LLM, dahin, dass ein lokales LLM genutzt wird
@@ -228,23 +229,36 @@ def fetch_llm(prompt: Union[str, None],
     if prompt is None:
         return None
 
+    """ 
     path = os.path.join(os.path.dirname(__file__), "LLMs")
+    print(path)
     try:
-        model = GPT4All(model_name = llm_name, model_path = path, allow_download = False, device = 'cuda')
-        device = model.device
+        print(GPT4All.list_gpus())
     except ValueError as e:
         print(e)
-        device = None
+    """
 
-    if device is None:
+    # print(torch.cuda.is_available())
+
+    # try:
+    model = GPT4All(model_name = llm_name, device = 'kompute', allow_download = False, verbose=True)
+    # except ValueError as e:
+        # print(e)
+        # return None
+        # device = None
+
+    # print(model.device)
+    """if device is None:
         model = GPT4All(model_name = llm_name, model_path = path, allow_download = False)
         device = 'CPU'
-    print(device)
+    print(device)"""
 
     retries = 0
     while True:
         try:
+            # Hier noch with model.chat_session(): einfügen!!
             response = model.generate(prompt, max_tokens = 5, temp = 0.2)
+            response = response.split('\n', 1)[0]
             choices = response['choices'][0]
             correction_tokens = [y['token'] for y in choices['logprobs']['content']]
             token_logprobs = [y['logprob'] for y in choices['logprobs']['content']]
@@ -261,7 +275,7 @@ def fetch_llm(prompt: Union[str, None],
     return llm_result
 
 
-    """
+"""
     Sends request to openai to get a prompt resolved. Returns the response.
     
     if prompt is None:

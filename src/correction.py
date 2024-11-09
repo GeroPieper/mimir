@@ -1003,7 +1003,7 @@ if __name__ == "__main__":
     test_synth_data_direction = 'user_data'
     #llm_name_corrfm = "gpt-4-turbo"  # only use this for tax, because experiments get expensive :)
     # llm_name_corrfm = "gpt-3.5-turbo"
-    llm_name_corrfm = "mistral-7b-instruct-v0.2.Q4_0.gguf"
+    llm_name_corrfm = "Meta-Llama-3-8B-Instruct.Q4_0.gguf"
     sampling_technique = 'greedy'
 
     # Set this parameter to keep runtimes low when debugging
@@ -1018,4 +1018,4 @@ if __name__ == "__main__":
                      fd_feature, dataset_analysis, llm_name_corrfm, sampling_technique)
     app.VERBOSE = True
     random_seed = 0
-    correction_dictionary = app.run(data, random_seed, synchronous=False)
+    correction_dictionary = app.run(data, random_seed, synchronous=True)
