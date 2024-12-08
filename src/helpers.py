@@ -1,6 +1,4 @@
-import os
 import json
-# import time
 import random
 import sqlite3
 import numpy as np
@@ -8,15 +6,21 @@ from typing import Union, Dict, Tuple, List
 from dataclasses import dataclass
 from collections import defaultdict
 
-from gpt4all import GPT4All
+import torch
+import torch.nn.functional as F
+
+from transformers import GPT2TokenizerFast, GPT2LMHeadModel
+
 
 # import openai
 import pandas as pd
 # import dotenv
-from sympy import false
+
 
 # dotenv.load_dotenv()
 # openai.api_key = os.environ.get('OPENAI_API_KEY')
+tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")   # TODO anderes Modell einsetzen
+model = GPT2LMHeadModel.from_pretrained("gpt2")
 
 @dataclass
 class LLMRequest:
@@ -139,6 +143,24 @@ class Corrections:
                     ground_truth_mentioned += 1
         return ground_truth_mentioned
 
+class GPT4AllModelSession:
+    _instance = None
+    
+    def __new__(cls, model):
+        if cls._instance is None:
+            cls._instance = super(GPT4AllModelSession, cls).__new__(cls)
+            cls._instance.model = model
+            cls._instance.chat_session = cls._instance.model.chat_session(system_prompt=
+                "You are a data cleaning machine that detects patterns to return a correction. If you do "                                                                                                                                                         
+                "not find a correction, you return the token <NULL>. You always follow the example and "
+                "return NOTHING but the correction or <NULL>.\n---\n")
+            print(f"Modell und Sitzung initialisiert. Mit {model.device}") #print zu logger Eintrag ändern
+        return cls._instance
+    
+    def generate_response(self, prompt, max_tokens):
+        # with self.chat_session:
+        #return self.model.generate(prompt, max_tokens=max_tokens, temp=0.2)
+        return self.model.generate(prompt, max_tokens=max_tokens, temp=0, top_k=1) # TODO Trade-Off von temp, top_k und Qualität, Laufzeit untersuchen
 
 def connect_to_cache() -> sqlite3.Connection:
     """
@@ -213,10 +235,12 @@ def fetch_cache(dataset: str,
     return None
 
 
-def fetch_llm(prompt: Union[str, None],
+def fetch_llm_GPT4all(prompt: Union[str, None],
+              old_value: str,
               dataset: str,
               error_cell: Tuple[int, int],
               correction_model_name: str,
+              gpt_session: GPT4AllModelSession,
               error_fraction: Union[None, int] = None,
               version: Union[None, int] = None,
               error_class: Union[None, str] = None,
@@ -225,101 +249,65 @@ def fetch_llm(prompt: Union[str, None],
               ) -> Union[LLMResult, None]:
     """
     Überarbeitung von fetch_LLM, dahin, dass ein lokales LLM genutzt wird
+    @rtype: object
+    @param prompt: 
+    @param dataset: 
+    @param error_cell: 
+    @param correction_model_name: 
+    @param error_fraction: 
+    @param version:
+    @param error_class: 
+    @param llm_name: 
+    @return: 
+    @type gpt_session: object
     """
     if prompt is None:
         return None
 
-    """ 
-    path = os.path.join(os.path.dirname(__file__), "LLMs")
-    print(path)
-    try:
-        print(GPT4All.list_gpus())
-    except ValueError as e:
-        print(e)
-    """
-
-    # print(torch.cuda.is_available())
-
-    # try:
-    model = GPT4All(model_name = llm_name, device = 'kompute', allow_download = False, verbose=True)
-    # except ValueError as e:
-        # print(e)
-        # return None
-        # device = None
-
-    # print(model.device)
-    """if device is None:
-        model = GPT4All(model_name = llm_name, model_path = path, allow_download = False)
-        device = 'CPU'
-    print(device)"""
-
-    retries = 0
     while True:
         try:
-            # Hier noch with model.chat_session(): einfügen!!
-            response = model.generate(prompt, max_tokens = 5, temp = 0.2)
-            response = response.split('\n', 1)[0]
-            choices = response['choices'][0]
-            correction_tokens = [y['token'] for y in choices['logprobs']['content']]
-            token_logprobs = [y['logprob'] for y in choices['logprobs']['content']]
-            top_logprobs = [{p['token']: p['logprob'] for p in position['top_logprobs']} for position in
-                            choices['logprobs']['content']]
+            response = gpt_session.generate_response(prompt, len(old_value)) #ist nur eine Annäherung an die benötigten Token
+            response_text = response.split('\n', 1)[0]
+
+            # Tokenize die Antwort und berechne die Wahrscheinlichkeiten
+            inputs = tokenizer(prompt, return_tensors="pt")
+            response_inputs = tokenizer(response_text, return_tensors="pt", add_special_tokens=False)
+
+            with torch.no_grad():                                               # TODO zu langsame, zu ungenau
+                outputs = model(**inputs)
+                logits = outputs.logits[:, -response_inputs.input_ids.size(-1):,
+                         :]  # Nur relevante Logits für generierte Antwort
+
+                # Wahrscheinlichkeiten berechnen
+                probs = F.softmax(logits, dim=-1)
+                log_probs = torch.log(probs)
+
+            # Extrahiere Token-Logwahrscheinlichkeiten
+            correction_tokens = tokenizer.convert_ids_to_tokens(response_inputs.input_ids[0])
+            token_logprobs = [
+                log_probs[0, i, token_id].item() / 100000                       # TODO andere Normalisierung anwenden
+                for i, token_id in enumerate(response_inputs.input_ids[0])
+            ]
+
+            print(f"Error: {old_value}, Korrektur: {response_text}, logprobs: {token_logprobs}")
+
+            # Berechne Top-Log-Wahrscheinlichkeiten
+            top_logprobs = []
+            for i, token_id in enumerate(response_inputs.input_ids[0]):
+                token_probs, token_indices = torch.topk(probs[0, i], k=5)
+                top_logprobs.append({
+                    tokenizer.convert_ids_to_tokens(idx.item()): torch.log(prob).item()
+                    for prob, idx in zip(token_probs, token_indices)
+                })
             break
-        except Exception:
-            print(f'Encountered unexpected exception {Exception}.')
+        except Exception as e:
+            print(f'Encountered unexpected exception: {e}')
             return None
 
     row, column = error_cell
     llm_result = LLMResult(dataset, row, column, correction_model_name, correction_tokens, token_logprobs, top_logprobs,
                            error_fraction, version, error_class, llm_name)
     return llm_result
-
-
-"""
-    Sends request to openai to get a prompt resolved. Returns the response.
-    
-    if prompt is None:
-        return None
-
-    retries = 0
-    while True:
-        try:
-            response = openai.ChatCompletion.create(
-                model=llm_name,
-                messages=[{
-                    'role': 'user',
-                    'content': prompt,
-                }],
-                logprobs=True,
-                top_logprobs=3
-            )
-
-            choices = response['choices'][0]
-            correction_tokens = [y['token'] for y in choices['logprobs']['content']]
-            token_logprobs = [y['logprob'] for y in choices['logprobs']['content']]
-            top_logprobs = [{p['token']: p['logprob'] for p in position['top_logprobs']} for position in choices['logprobs']['content']]
-            break
-        except openai.error.RateLimitError as e:
-            if retries > 5:
-                print('Exceeded maximum number of retries. Skipping correction. The OpenAI API appears unreachable:')
-                print(e)
-                return None
-            delay = (2 ** retries) + random.random()
-            print(f"Rate limit exceeded, retrying in {delay} seconds.")
-            time.sleep(delay)
-            retries += 1
-        except openai.error.AuthenticationError:
-            print(f'Tried sending {correction_model_name} prompt to OpenAI to correct cell {error_cell}.')
-            print('However, there is no authentication provided in the .env file. Returning no corrections.')
-            return None
-        except Exception:
-            print(f'Encountered unexpected exception {Exception}.')
-            return None
-
-    row, column = error_cell
-    llm_result = LLMResult(dataset, row, column, correction_model_name, correction_tokens, token_logprobs, top_logprobs, error_fraction, version, error_class, llm_name)
-    return llm_result
-"""
 
 def insert_llm_into_cache(llm_result: LLMResult):
     """
@@ -395,10 +383,9 @@ def llm_correction_prompt(old_value: str, error_correction_pairs: List[Tuple[str
     Generate the llm_correction prompt sent to the LLM.
     """
 
-    prompt = "You are a data cleaning machine that detects patterns to return a correction. If you do "\
-                "not find a correction, you return the token <NULL>. You always follow the example and "\
-                "return NOTHING but the correction or <NULL>.\n---\n"
+    prompt = ""
 
+    # Von 10 auf 4 gekürzt um eine schnellere Verarbeitung zu erzielen # TODO Trade-Off zwischen Länge des prompts - Zeit - Qualität untersuchen
     n_pairs = min(10, len(error_correction_pairs))
 
     for (error, correction) in random.sample(error_correction_pairs, n_pairs):

@@ -3,9 +3,11 @@ import json
 import pickle
 import random
 import difflib
+import threading
 import unicodedata
 import multiprocessing
 import concurrent.futures
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from itertools import combinations
 import logging
 import numpy as np
@@ -18,6 +20,13 @@ import sklearn.tree
 import sklearn.feature_selection
 
 from typing import Dict, List, Tuple
+
+import time
+from datetime import timedelta
+import math
+import concurrent.futures
+from gpt4all import GPT4All
+from joblib.externals.loky.backend.queues import Queue
 
 import dataset
 import auto_instance
@@ -61,7 +70,7 @@ class Cleaning:
                  gpdep_threshold: float = 0.3,
                  fd_feature: str = 'norm_gpdep',
                  dataset_analysis: bool = False,
-                 llm_name_corrfm: str = 'gpt-3.5-turbo',
+                 llm_name_corrfm: str = 'Meta-Llama-3-8B-Instruct.Q4_0.gguf',
                  sampling_technique: str = 'baran'):
         """
         Parameters of the cleaning experiment.
@@ -103,7 +112,6 @@ class Cleaning:
 
         self.SYNTH_TUPLES = synth_tuples
         self.CLEAN_WITH_USER_INPUT = clean_with_user_input
-
         self.SAMPLING_TECHNIQUE = sampling_technique
         self.FEATURE_GENERATORS = feature_generators
         self.VICINITY_ORDERS = vicinity_orders
@@ -470,7 +478,8 @@ class Cleaning:
                 synthetic_error_rows = [x[0] for x in ranked_candidate_rows]
             d.synthetic_error_cells = [(i, j) for i in synthetic_error_rows for j in range(d.dataframe.shape[1])]
 
-    def prepare_augmented_models(self, d, synchronous=False):
+
+    def prepare_augmented_models(self, d, gpt_session, synchronous=False):
         """
         Prepare Mimir's augmented models:
         1) Calculate gpdeps and append them to d.
@@ -529,7 +538,7 @@ class Cleaning:
                                                                             pdep_tuple.gpdep,
                                                                             pdep_tuple.epdep,
                                                                             pdep_tuple.gpdep / norm_sum)
-            self.logger.debug('')
+            #self.logger.debug('')
 
         if 'llm_master' in self.FEATURE_GENERATORS:
             # use large language model to correct an error based on the error's vicinity. Inspired by Narayan et al.
@@ -553,12 +562,8 @@ class Cleaning:
             self.logger.debug(f'Identified {len(fetch_llm_master_args)} llm_master corrections not yet cached. Fetching...')
                 
             if len(fetch_llm_master_args) > 0:
-                if synchronous:
-                    llm_master_results = map(helpers.fetch_llm, *zip(*fetch_llm_master_args))
-                else:
-                    chunksize = len(fetch_llm_master_args) // min(len(fetch_llm_master_args), n_workers)
-                    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
-                        llm_master_results = executor.map(helpers.fetch_llm, *zip(*fetch_llm_master_args), chunksize=chunksize)
+                llm_master_results = map(helpers.fetch_llm, *zip(*fetch_llm_master_args))
+
             for llm_result in llm_master_results:
                 if llm_result is not None:
                     helpers.insert_llm_into_cache(llm_result)
@@ -585,27 +590,30 @@ class Cleaning:
 
             for (row, col) in d.detected_cells:
                 old_value = d.dataframe.iloc[(row, col)]
-                if old_value != '' and error_correction_pairs.get(col) is not None:  # Skip if there is no value to be transformed or no cleaning examples
-                    if helpers.fetch_cache(d.name, (row, col), 'llm_correction', d.error_fraction, d.version, d.error_class, self.LLM_NAME_CORRFM) is None:
+                if old_value != '' and error_correction_pairs.get(
+                        col) is not None:  # Skip if there is no value to be transformed or no cleaning examples
+                    if helpers.fetch_cache(d.name, (row, col), 'llm_correction', d.error_fraction, d.version,
+                                           d.error_class, self.LLM_NAME_CORRFM) is None:
                         prompt = helpers.llm_correction_prompt(old_value, error_correction_pairs[col])
-                        fetch_llm_correction_args.append([prompt, d.name, (row, col), 'llm_correction', d.error_fraction, d.version, d.error_class, self.LLM_NAME_CORRFM])
+                        fetch_llm_correction_args.append(
+                            [prompt, old_value, d.name, (row, col), 'llm_correction', gpt_session, d.error_fraction,
+                             d.version, d.error_class, llm_name_corrfm]
+                        )
 
-            self.logger.debug(f'Identified {len(fetch_llm_correction_args)} llm_correction corrections not yet cached. Fetching...')
-            
+            self.logger.debug(
+                f'Identified {len(fetch_llm_correction_args)} llm_correction corrections not yet cached. Fetching...')
+
             if len(fetch_llm_correction_args) > 0:
-                if synchronous:
-                    llm_results = map(helpers.fetch_llm, *zip(*fetch_llm_correction_args))
-                else:
-                    chunksize = len(fetch_llm_correction_args) // min(len(fetch_llm_correction_args), n_workers)
-                    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
-                        llm_results = executor.map(helpers.fetch_llm, *zip(*fetch_llm_correction_args), chunksize=chunksize)
-
+                llm_results = map(helpers.fetch_llm_GPT4all, *zip(*fetch_llm_correction_args))
+            
             for llm_result in llm_results:
                 if llm_result is not None:
-                    helpers.insert_llm_into_cache(llm_result)
+                    helpers.insert_llm_into_cache(llm_result)       # TODO zu langsam, aufgrund der fehlenden Parallelisierung
                 else:
                     self.logger.debug('Unable to fetch llm_correction result.')
-            self.logger.debug(f'Fetched {len(fetch_llm_correction_args)} llm_correction corrections and added them to the cache.')
+            self.logger.debug(
+                f'Fetched {len(fetch_llm_correction_args)} llm_correction corrections and added them to the cache.')
+
 
         if 'auto_instance' in self.FEATURE_GENERATORS:
             self.logger.debug('Start training DataWig Models.')
@@ -632,7 +640,7 @@ class Cleaning:
                     # this saves a lot of runtime for large datasets with few errors.
                     rows_to_predict = [x[0] for x in column_errors[i_col]] + [x[0] for x in d.synthetic_error_cells if x[1] == i_col]
                     self.logger.debug(f'Trained DataWig model for column {col} ({i_col}).')
-                    try: 
+                    try:
                         d.imputer_models[i_col] = imp.predict_proba(d.typed_dataframe.iloc[rows_to_predict, :])
                         self.logger.debug(f'Used DataWig model to infer values for column {col} ({i_col}).')
                     except Exception as e:
@@ -950,6 +958,17 @@ class Cleaning:
         # This makes the sampling process deterministic.
         random.seed(random_seed)
 
+        with ThreadPoolExecutor(max_workers=1) as executor:     # TODO funktioniert noch nicht wie gewünscht!
+            model_future: Future = executor.submit(
+                lambda: GPT4All(                                # TODO cuda Fehlermeldungen untersuchen / unterdrücken
+                    model_name=self.LLM_NAME_CORRFM,
+                    model_path="/home/gero/Schreibtisch/Bachelorarbeit/mimir/src/LLMs/",
+                    device='kompute',
+                    allow_download=False,
+                    verbose=True
+                )
+            )
+
         d = self.initialize_dataset(d)
         if len(d.detected_cells) == 0:
             raise ValueError('There are no errors in the data to correct.')
@@ -961,7 +980,11 @@ class Cleaning:
         self.update_models(d)
 
         self.draw_synth_error_positions(d)
-        self.prepare_augmented_models(d, synchronous)
+
+        model = model_future.result()
+        gpt_session = helpers.GPT4AllModelSession(model)
+
+        self.prepare_augmented_models(d, gpt_session, synchronous)
         self.generate_features(d, synchronous)
         self.generate_inferred_features(d, synchronous)
         self.binary_predict_corrections(d)
@@ -985,6 +1008,7 @@ if __name__ == "__main__":
     version = 1
     n_rows = None
 
+    # TODO Parameter für lokales LLM hinzufügen
     labeling_budget = 20
     synth_tuples = 100
     synth_cleaning_threshold = 0.9
@@ -992,7 +1016,9 @@ if __name__ == "__main__":
     clean_with_user_input = True  # Careful: If set to False, d.corrected_cells will remain empty.
     gpdep_threshold = 0.3
     training_time_limit = 90
-    feature_generators = ['auto_instance', 'fd', 'llm_correction', 'llm_master']
+    #feature_generators = ['auto_instance', 'fd', 'llm_correction', 'llm_master']
+    feature_generators = ['auto_instance', 'fd', 'llm_correction']
+    #feature_generators = ['llm_correction']
     #feature_generators = ['llm_master']
     classification_model = "ABC"
     fd_feature = 'norm_gpdep'
@@ -1002,7 +1028,7 @@ if __name__ == "__main__":
     pdep_features = ['pr']
     test_synth_data_direction = 'user_data'
     #llm_name_corrfm = "gpt-4-turbo"  # only use this for tax, because experiments get expensive :)
-    # llm_name_corrfm = "gpt-3.5-turbo"
+    #llm_name_corrfm = "gpt-3.5-turbo"
     llm_name_corrfm = "Meta-Llama-3-8B-Instruct.Q4_0.gguf"
     sampling_technique = 'greedy'
 
@@ -1018,4 +1044,4 @@ if __name__ == "__main__":
                      fd_feature, dataset_analysis, llm_name_corrfm, sampling_technique)
     app.VERBOSE = True
     random_seed = 0
-    correction_dictionary = app.run(data, random_seed, synchronous=True)
+    correction_dictionary = app.run(data, random_seed, synchronous=True) # TODO synchronous kann vermutlich raus?
