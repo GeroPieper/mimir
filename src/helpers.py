@@ -43,6 +43,19 @@ class LLMResult:
     error_class: Union[str, None]
     llm_name: str
 
+@dataclass
+class LLMResultGPT4All:
+    prompt: str
+    dataset: str
+    row: int
+    column: int
+    response_text: str
+    correction_model_name: str
+    error_fraction: Union[int, None]
+    version: Union[int, None]
+    error_class: Union[str, None]
+    llm_name: str
+
 
 @dataclass
 class ErrorPositions:
@@ -158,9 +171,9 @@ class GPT4AllModelSession:
         return cls._instance
     
     def generate_response(self, prompt, max_tokens):
-        # with self.chat_session:
-        #return self.model.generate(prompt, max_tokens=max_tokens, temp=0.2)
-        return self.model.generate(prompt, max_tokens=max_tokens, temp=0, top_k=1) # TODO Trade-Off von temp, top_k und Qualität, Laufzeit untersuchen
+        #with model.chat_session:
+            #return self.model.generate(prompt, max_tokens=max_tokens, temp=0.2)
+        return self.model.generate(prompt, max_tokens=max_tokens, top_k=1, temp=0) # TODO Trade-Off von temp, top_k und Qualität, Laufzeit untersuchen
 
 def connect_to_cache() -> sqlite3.Connection:
     """
@@ -234,7 +247,7 @@ def fetch_cache(dataset: str,
         return json.loads(result[0]), json.loads(result[1]), json.loads(result[2])  # access the correction
     return None
 
-
+"""
 def fetch_llm_GPT4all(prompt: Union[str, None],
               old_value: str,
               dataset: str,
@@ -247,7 +260,8 @@ def fetch_llm_GPT4all(prompt: Union[str, None],
               #llm_name: str = "gpt-3.5-turbo"
               llm_name: str = "Meta-Llama-3-8B-Instruct.Q4_0.gguf"
               ) -> Union[LLMResult, None]:
-    """
+    
+    
     Überarbeitung von fetch_LLM, dahin, dass ein lokales LLM genutzt wird
     @rtype: object
     @param prompt: 
@@ -260,7 +274,7 @@ def fetch_llm_GPT4all(prompt: Union[str, None],
     @param llm_name: 
     @return: 
     @type gpt_session: object
-    """
+    
     if prompt is None:
         return None
 
@@ -307,7 +321,84 @@ def fetch_llm_GPT4all(prompt: Union[str, None],
     row, column = error_cell
     llm_result = LLMResult(dataset, row, column, correction_model_name, correction_tokens, token_logprobs, top_logprobs,
                            error_fraction, version, error_class, llm_name)
+    return llm_result"""
+
+def generate_llm_response(prompt: Union[str, None],
+              old_value: str,
+              dataset: str,
+              error_cell: Tuple[int, int],
+              correction_model_name: str,
+              gpt_session: GPT4AllModelSession,
+              error_fraction: Union[None, int] = None,
+              version: Union[None, int] = None,
+              error_class: Union[None, str] = None,
+              #llm_name: str = "gpt-3.5-turbo"
+              llm_name: str = "Meta-Llama-3-8B-Instruct.Q4_0.gguf"
+              ) -> Union[LLMResultGPT4All, None]:
+    """
+    Generiert eine Antwort mit GPT4All.
+    """
+    try:
+        response = gpt_session.generate_response(prompt, len(old_value))  # ist nur eine Annäherung an die benötigten Token
+        response_text = response.split('\n', 1)[0]
+        print(f"Error: {old_value}, Korrektur: {response_text}")
+
+    except Exception as e:
+        print(f"Error generating response: {e}")
+        row, column = error_cell
+        llm_result = LLMResultGPT4All(prompt, dataset, row, column, "NULL", correction_model_name,
+                                      error_fraction, version, error_class, llm_name)
+        return llm_result
+
+    row, column = error_cell
+    llm_result = LLMResultGPT4All(prompt, dataset, row, column, response_text, correction_model_name,
+                           error_fraction, version, error_class, llm_name)
     return llm_result
+
+def compute_token_logprobs(llm_result: LLMResultGPT4All) -> LLMResult | None:
+    """
+    Berechnet die Token-Logwahrscheinlichkeiten und Top-Logwahrscheinlichkeiten für eine Antwort.
+    """
+    try:
+        # Tokenize Prompt und Response
+        inputs = tokenizer(llm_result.prompt, return_tensors="pt")
+        response_inputs = tokenizer(llm_result.response_text, return_tensors="pt", add_special_tokens=False)
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits[:, -response_inputs.input_ids.size(-1):, :]  # Nur relevante Logits
+            probs = F.softmax(logits, dim=-1)
+            log_probs = torch.log(probs)
+
+        # Extrahiere Token-Logwahrscheinlichkeiten
+        correction_tokens = tokenizer.convert_ids_to_tokens(response_inputs.input_ids[0])
+        token_logprobs = [
+            log_probs[0, i, token_id].item() / 100000  # TODO: Skalierungsfaktor optimieren
+            for i, token_id in enumerate(response_inputs.input_ids[0])
+        ]
+
+        # Berechne Top-Log-Wahrscheinlichkeiten
+        top_logprobs = []
+        """for i, token_id in enumerate(response_inputs.input_ids[0]):
+            token_probs, token_indices = torch.topk(probs[0, i], k=5)
+            top_logprobs.append({
+                tokenizer.convert_ids_to_tokens(idx.item()): torch.log(prob).item()
+                for prob, idx in zip(token_probs, token_indices)
+            })"""
+
+    except Exception as e:
+        print(f"Error computing token logprobs: {e}")
+        llm_result = LLMResult(llm_result.dataset, llm_result.row, llm_result.column, llm_result.correction_model_name,
+                               ['NULL'], [], [], llm_result.error_fraction,
+                               llm_result.version, llm_result.error_class, llm_result.llm_name)
+        return llm_result
+
+    llm_result = LLMResult(llm_result.dataset, llm_result.row, llm_result.column, llm_result.correction_model_name,
+                           correction_tokens, token_logprobs, top_logprobs, llm_result.error_fraction,
+                           llm_result.version, llm_result.error_class, llm_result.llm_name)
+
+    return llm_result
+
 
 def insert_llm_into_cache(llm_result: LLMResult):
     """
@@ -383,10 +474,17 @@ def llm_correction_prompt(old_value: str, error_correction_pairs: List[Tuple[str
     Generate the llm_correction prompt sent to the LLM.
     """
 
-    prompt = ""
+    prompt = ("You are a data cleaning machine that detects patterns to return a correction. If you do "
+              "not find a correction, you return the token <NULL>. You always follow the example and "
+              "return NOTHING but the correction, <MV> or <NULL>.\n---\n")
 
+    """ "neuer" prompt ist schlechter als der "alte" - für später als Referenz aufheben
+    prompt = ("You are a data cleaning machine designed to detect patterns and return corrections. If no correction is "   
+              "found, respond with the token <NULL>.  Always adhere to the provided format and return ONLY the correction "
+              "or <NULL>.")
+    """
     # Von 10 auf 4 gekürzt um eine schnellere Verarbeitung zu erzielen # TODO Trade-Off zwischen Länge des prompts - Zeit - Qualität untersuchen
-    n_pairs = min(10, len(error_correction_pairs))
+    n_pairs = min(14, len(error_correction_pairs))
 
     for (error, correction) in random.sample(error_correction_pairs, n_pairs):
         prompt = prompt + f"error:{error}" + '\n' + f"correction:{correction}" + '\n'

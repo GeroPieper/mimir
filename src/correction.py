@@ -7,11 +7,12 @@ import threading
 import unicodedata
 import multiprocessing
 import concurrent.futures
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from itertools import combinations
 import logging
 import numpy as np
-import math
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+# from queue import Queue
+from multiprocessing import get_context, Queue
 
 import sklearn.svm
 import sklearn.ensemble
@@ -541,40 +542,70 @@ class Cleaning:
             #self.logger.debug('')
 
         if 'llm_master' in self.FEATURE_GENERATORS:
-            # use large language model to correct an error based on the error's vicinity. Inspired by Narayan et al.
-            # 2022.
+            # Producer-Consumer Pattern for llm_master corrections
             fetch_llm_master_args = []
-            llm_master_results: List[helpers.LLMResult] = []
+            # llm_master_results: List[helpers.LLMResult] = [] # TODO delete
 
+            # Prepare clean data subset for context
             inputted_rows = list(d.labeled_tuples.keys())
             user_input = d.clean_dataframe.iloc[inputted_rows, :]
             df_clean_subset = auto_instance.get_clean_table(d.dataframe, d.detected_cells, user_input)
-            error_free_rows = df_clean_subset.shape[1]
-            
+            error_free_rows = df_clean_subset.shape[0]
+
             df_error_free_subset = df_clean_subset.sample(min(100, error_free_rows))
 
+            # Construct prompts for each detected cell
             for (row, col) in d.detected_cells:
-                if helpers.fetch_cache(d.name, (row, col), 'llm_master', d.error_fraction, d.version, d.error_class, 'gpt-3.5-turbo') is None:
+                if helpers.fetch_cache(d.name, (row, col), 'llm_master', d.error_fraction, d.version, d.error_class,
+                                       'gpt-3.5-turbo') is None:
                     df_row_with_error = d.dataframe.iloc[row, :].copy()
                     prompt = helpers.llm_master_prompt((row, col), df_error_free_subset, df_row_with_error)
-                    fetch_llm_master_args.append([prompt, d.name, (row, col), 'llm_master', d.error_fraction, d.version, d.error_class, 'gpt-3.5-turbo'])
+                    fetch_llm_master_args.append(
+                        [prompt, d.name, (row, col), 'llm_master', d.error_fraction, d.version, d.error_class,
+                         'gpt-3.5-turbo']
+                    )
 
-            self.logger.debug(f'Identified {len(fetch_llm_master_args)} llm_master corrections not yet cached. Fetching...')
-                
+            self.logger.debug(
+                f'Identified {len(fetch_llm_master_args)} llm_master corrections not yet cached. Fetching...')
+
             if len(fetch_llm_master_args) > 0:
-                llm_master_results = map(helpers.fetch_llm, *zip(*fetch_llm_master_args))
+                llm_results = map(helpers.fetch_llm, *zip(*fetch_llm_master_args))
 
-            for llm_result in llm_master_results:
-                if llm_result is not None:
-                    helpers.insert_llm_into_cache(llm_result)
-                else:
-                    self.logger.debug('Unable to fetch llm_master result.')
-            self.logger.debug(f'Fetched {len(fetch_llm_master_args)} llm_master corrections and added them to the cache.')
+                # Implement Producer-Consumer Pattern
+                ctx = get_context("spawn")
+                queue = ctx.Queue()
+
+                def producer(llm_results, queue):
+                    for llm_result in llm_results:
+                        if llm_result is not None:
+                            result = llm_result
+                            queue.put(result)
+                    queue.put(None)
+
+                def consumer(queue):
+                    while True:
+                        result = queue.get()
+                        if result is None:
+                            break
+                        llm_result = helpers.compute_token_logprobs(result)
+                        helpers.insert_llm_into_cache(llm_result)
+
+                producer_thread = threading.Thread(target=producer, args=(llm_results, queue))
+                consumer_thread = threading.Thread(target=consumer, args=(queue,))
+
+                producer_thread.start()
+                consumer_thread.start()
+
+                producer_thread.join()
+                consumer_thread.join()
+
+            self.logger.debug(
+                f'Fetched {len(fetch_llm_master_args)} llm_master corrections and added them to the cache.')
 
         if 'llm_correction' in self.FEATURE_GENERATORS:  # send all LLM-queries and add the to cache
             error_correction_pairs: Dict[int, List[Tuple[str, str]]] = {}
             fetch_llm_correction_args = []
-            llm_results: List[helpers.LLMResult] = []
+            # llm_results: List[helpers.LLMResult] = [] # TODO delete
 
             # Construct pairs of ('error', 'correction') per column by iterating over the user input.
             for cell in d.labeled_cells:
@@ -604,13 +635,36 @@ class Cleaning:
                 f'Identified {len(fetch_llm_correction_args)} llm_correction corrections not yet cached. Fetching...')
 
             if len(fetch_llm_correction_args) > 0:
-                llm_results = map(helpers.fetch_llm_GPT4all, *zip(*fetch_llm_correction_args))
-            
-            for llm_result in llm_results:
-                if llm_result is not None:
-                    helpers.insert_llm_into_cache(llm_result)       # TODO zu langsam, aufgrund der fehlenden Parallelisierung
-                else:
-                    self.logger.debug('Unable to fetch llm_correction result.')
+                llm_results = map(helpers.generate_llm_response, *zip(*fetch_llm_correction_args))
+
+                ctx = get_context("spawn")
+                queue = ctx.Queue()
+
+                def producer(llm_results, queue):
+                    for llm_result in llm_results:
+                        if llm_result is not None:
+                            result = llm_result
+                            queue.put(result)
+                    queue.put(None)
+
+                def consumer(queue):
+                    while True:
+                        result = queue.get()
+                        if result is None:
+                            break
+                        llm_result = helpers.compute_token_logprobs(result)
+                        helpers.insert_llm_into_cache(llm_result)
+
+
+                producer_thread = threading.Thread(target=producer, args=(llm_results, queue))
+                consumer_thread = threading.Thread(target=consumer, args=(queue, ))
+
+                producer_thread.start()
+                consumer_thread.start()
+
+                producer_thread.join()
+                consumer_thread.join()
+
             self.logger.debug(
                 f'Fetched {len(fetch_llm_correction_args)} llm_correction corrections and added them to the cache.')
 
@@ -649,6 +703,7 @@ class Cleaning:
                 else:
                     d.imputer_models[i_col] = None
                     self.logger.debug(f'Failed to train a DataWig model for column {col} ({i_col}).')
+
 
     def generate_features(self, d, synchronous):
         """
@@ -1002,7 +1057,7 @@ if __name__ == "__main__":
     # store results for detailed analysis
     dataset_analysis = True
 
-    dataset_name = "beers"
+    dataset_name = "rayyan"
     error_class = "simple_mcar"
     error_fraction = 3
     version = 1
