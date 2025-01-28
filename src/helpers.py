@@ -247,81 +247,6 @@ def fetch_cache(dataset: str,
         return json.loads(result[0]), json.loads(result[1]), json.loads(result[2])  # access the correction
     return None
 
-"""
-def fetch_llm_GPT4all(prompt: Union[str, None],
-              old_value: str,
-              dataset: str,
-              error_cell: Tuple[int, int],
-              correction_model_name: str,
-              gpt_session: GPT4AllModelSession,
-              error_fraction: Union[None, int] = None,
-              version: Union[None, int] = None,
-              error_class: Union[None, str] = None,
-              #llm_name: str = "gpt-3.5-turbo"
-              llm_name: str = "Meta-Llama-3-8B-Instruct.Q4_0.gguf"
-              ) -> Union[LLMResult, None]:
-    
-    
-    Überarbeitung von fetch_LLM, dahin, dass ein lokales LLM genutzt wird
-    @rtype: object
-    @param prompt: 
-    @param dataset: 
-    @param error_cell: 
-    @param correction_model_name: 
-    @param error_fraction: 
-    @param version:
-    @param error_class: 
-    @param llm_name: 
-    @return: 
-    @type gpt_session: object
-    
-    if prompt is None:
-        return None
-
-    while True:
-        try:
-            response = gpt_session.generate_response(prompt, len(old_value)) #ist nur eine Annäherung an die benötigten Token
-            response_text = response.split('\n', 1)[0]
-
-            # Tokenize die Antwort und berechne die Wahrscheinlichkeiten
-            inputs = tokenizer(prompt, return_tensors="pt")
-            response_inputs = tokenizer(response_text, return_tensors="pt", add_special_tokens=False)
-
-            with torch.no_grad():                                               # TODO zu langsame, zu ungenau
-                outputs = model(**inputs)
-                logits = outputs.logits[:, -response_inputs.input_ids.size(-1):,
-                         :]  # Nur relevante Logits für generierte Antwort
-
-                # Wahrscheinlichkeiten berechnen
-                probs = F.softmax(logits, dim=-1)
-                log_probs = torch.log(probs)
-
-            # Extrahiere Token-Logwahrscheinlichkeiten
-            correction_tokens = tokenizer.convert_ids_to_tokens(response_inputs.input_ids[0])
-            token_logprobs = [
-                log_probs[0, i, token_id].item() / 100000                       # TODO andere Normalisierung anwenden
-                for i, token_id in enumerate(response_inputs.input_ids[0])
-            ]
-
-            print(f"Error: {old_value}, Korrektur: {response_text}, logprobs: {token_logprobs}")
-
-            # Berechne Top-Log-Wahrscheinlichkeiten
-            top_logprobs = []
-            for i, token_id in enumerate(response_inputs.input_ids[0]):
-                token_probs, token_indices = torch.topk(probs[0, i], k=5)
-                top_logprobs.append({
-                    tokenizer.convert_ids_to_tokens(idx.item()): torch.log(prob).item()
-                    for prob, idx in zip(token_probs, token_indices)
-                })
-            break
-        except Exception as e:
-            print(f'Encountered unexpected exception: {e}')
-            return None
-
-    row, column = error_cell
-    llm_result = LLMResult(dataset, row, column, correction_model_name, correction_tokens, token_logprobs, top_logprobs,
-                           error_fraction, version, error_class, llm_name)
-    return llm_result"""
 
 def generate_llm_response(prompt: Union[str, None],
               old_value: str,
@@ -468,23 +393,72 @@ def error_free_row_to_prompt(df: pd.DataFrame, row: int, column: int) -> Tuple[s
     assembled_row_values = ''.join(row_values)[:-1]
     return assembled_row_values, correction
 
+def map_error_types(column_type):
+    error_mapping = {
+        "Numeric": [
+            "Add Delta",
+            "Outlier",
+            "MissingValue",
+            "WrongUnit",
+            "Typo",
+            "Replace",
+            "CategorySwap",
+            "WrongDataType"
+        ],
+        "String": [
+            "Typo",
+            "CategorySwap",
+            "Mojibake",
+            "Replace",
+            "Extraneous",
+            "Permute",
+            "MissingValue",
+            "WrongDataType"
+        ],
+        "DateTime": [
+            "Typo",
+            "Replace",
+            "Outlier",
+            "Add Delta",
+            "Permute",
+            "MissingValue",
+            "WrongDataType",
+            "WrongUnit",
+            "FormatError"
+        ],
+        "Boolean": [
+            "MissingValue",
+            "Typo",
+            "Replace",
+            "WrongDataType",
+            "CategorySwap"
+        ],
+    }
+    return error_mapping.get(column_type, ["Unknown"])
 
-def llm_correction_prompt(old_value: str, error_correction_pairs: List[Tuple[str, str]]) -> str:
+def llm_correction_prompt(old_value: str, error_correction_pairs: List[Tuple[str, str]], column_name, category) -> str:
     """
     Generate the llm_correction prompt sent to the LLM.
     """
 
     prompt = ("You are a data cleaning machine that detects patterns to return a correction. If you do "
               "not find a correction, you return the token <NULL>. You always follow the example and "
-              "return NOTHING but the correction, <MV> or <NULL>.\n---\n")
+              "return NOTHING but the correction, <MV> or <NULL>.\n---\n"
+              f"column name: {column_name}\n"
+              f"column category: {category}\n"
+              f"possible errors for this category: {map_error_types(category)}\n"
+              f"examples:\n---\n")
+
 
     """ "neuer" prompt ist schlechter als der "alte" - für später als Referenz aufheben
     prompt = ("You are a data cleaning machine designed to detect patterns and return corrections. If no correction is "   
               "found, respond with the token <NULL>.  Always adhere to the provided format and return ONLY the correction "
               "or <NULL>.")
     """
+    error, correction = error_correction_pairs[0]
     # Von 10 auf 4 gekürzt um eine schnellere Verarbeitung zu erzielen # TODO Trade-Off zwischen Länge des prompts - Zeit - Qualität untersuchen
-    n_pairs = min(14, len(error_correction_pairs))
+    # dynamische Promptlänge, abhängig von der Länge des errors
+    n_pairs = min(int(300 / len(error)), len(error_correction_pairs))
 
     for (error, correction) in random.sample(error_correction_pairs, n_pairs):
         prompt = prompt + f"error:{error}" + '\n' + f"correction:{correction}" + '\n'

@@ -14,6 +14,8 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 # from queue import Queue
 from multiprocessing import get_context, Queue
 
+import re
+import pandas as pd
 import sklearn.svm
 import sklearn.ensemble
 import sklearn.linear_model
@@ -28,6 +30,8 @@ import math
 import concurrent.futures
 from gpt4all import GPT4All
 from joblib.externals.loky.backend.queues import Queue
+from numba.core.cgutils import true_bit
+from pandas import Series
 
 import dataset
 import auto_instance
@@ -234,7 +238,78 @@ class Cleaning:
         d.labeled_tuples = {} if not hasattr(d, "labeled_tuples") else d.labeled_tuples
         d.labeled_cells = {} if not hasattr(d, "labeled_cells") else d.labeled_cells
         d.corrected_cells = {} if not hasattr(d, "corrected_cells") else d.corrected_cells
+        d.column_categories = {} if not hasattr(d, "column_categories") else d.column_categories
         return d
+
+    def categorize_columns(self, d):
+        """
+        Categorizes each column in the dataframe and stores the result in d.column_categories.
+        """
+
+        self.logger.debug("Start categorizing columns.")
+        d.column_categories = {}
+        x = 0
+        for column_name in d.dataframe.columns:
+            column = d.dataframe[column_name]
+            category = self.detect_column_category(column)
+            d.column_categories[x] = column_name, category
+            self.logger.debug(f"Spalte {column_name} hat Kategorie {category}")
+            x += 1
+        self.logger.debug("Finished categorizing columns.")
+
+
+    def detect_column_category(self, column: Series) -> str:
+        """
+        Determines the category of a given column based on its data type.
+
+        :param column: A pandas Series representing the column to classify.
+        :return: One of "Numeric", "String", "DateTime", "Boolean", or "Unknown".
+        """
+
+        def looks_like_datetime(value):
+            patterns = [
+                # Date patterns
+                r"^\d{1,2}/\d{1,2}/\d{2,4}$",  # 1/1/04 or 01/01/2004
+                r"^\d{4}-\d{2}-\d{2}$",  # 2023-01-01
+                r"^\d{2}\.\d{2}\.\d{2,4}$",  # 01.01.23 or 01.01.2023
+                r"^\d{1,2}-\d{1,2}-\d{2,4}$",  # 1-1-04 or 01-01-2023
+                r"^\d{8}$",  # 01012023
+
+                # Time patterns
+                r"^\d{2}:\d{2}(:\d{2})?$",  # 15:30 or 15:30:00
+                r"^\d{2}:\d{2}:\d{2}\.\d{3}$",  # 15:30:45.123 (with milliseconds)
+                r"^\d{2}\d{2}$",  # 1530 (HHMM)
+
+                # Date and Time combinations
+                r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$",  # 2023-01-01T15:30
+                r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}$",  # 2023/01/01 15:30
+                r"^\d{1,2}-\w{3}-\d{2,4}$",  # 1-Jan-2023 or 01-Jan-23
+
+                # Month and Year
+                r"^\w{3,9} \d{4}$",  # January 2023
+                r"^\d{4} \w{3,9}$",  # 2023 January
+            ]
+            for pattern in patterns:
+                if re.match(pattern, str(value)):
+                    return True
+            return False
+
+        # Check if the column contains Boolean values
+        if pd.api.types.is_bool_dtype(column):
+            return "Boolean"
+        # Attempt to convert strings to numeric and check again
+        elif pd.api.types.is_numeric_dtype(column) or pd.to_numeric(column, errors="coerce").notna().all():
+            return "Numeric"
+        # Check for strings and potential datetimes
+        elif pd.api.types.is_string_dtype(column):
+            if column.apply(looks_like_datetime).mean() > 0.8:
+                return "DateTime"
+            return "String"
+        # Check for existing datetime types
+        elif pd.api.types.is_datetime64_any_dtype(column):
+            return "DateTime"
+        else:
+            return "Unknown"
 
     def initialize_models(self, d):
         """
@@ -350,10 +425,25 @@ class Cleaning:
                 sampled_index = np.random.choice(max_args)
                 sampled_tuples.append(sampled_index)
                 tuple_score = np.delete(tuple_score, sampled_index)
-
-        for sampled_tuple in sampled_tuples:
-            self.label_with_ground_truth(d, sampled_tuple)
-            self.sampled_tuples += 1
+        if not self.VERBOSE:
+            for sampled_tuple in sampled_tuples:
+                # Display the errors and request user input for corrections
+                row_data = d.dataframe.iloc[sampled_tuple, :]
+                print(f"Row {sampled_tuple}: {row_data}")
+                corrected_row = []
+                for col, value in enumerate(row_data):
+                    if (sampled_tuple, col) in d.detected_cells and value != '':
+                        print(f"  Column {col}, Detected Error: {value}")
+                        correction = input(f"    Please provide a correction for this value: ")
+                        corrected_row.append(correction)
+                    else:
+                        corrected_row.append(value)
+                d.labeled_cells[sampled_tuple] = corrected_row
+                self.sampled_tuples += 1
+        else:
+            for sampled_tuple in sampled_tuples:
+                self.label_with_ground_truth(d, sampled_tuple)
+                self.sampled_tuples += 1
 
         self.logger.debug('Finish tuple sampling.')
 
@@ -556,20 +646,22 @@ class Cleaning:
 
             # Construct prompts for each detected cell
             for (row, col) in d.detected_cells:
-                if helpers.fetch_cache(d.name, (row, col), 'llm_master', d.error_fraction, d.version, d.error_class,
-                                       'gpt-3.5-turbo') is None:
-                    df_row_with_error = d.dataframe.iloc[row, :].copy()
-                    prompt = helpers.llm_master_prompt((row, col), df_error_free_subset, df_row_with_error)
-                    fetch_llm_master_args.append(
-                        [prompt, d.name, (row, col), 'llm_master', d.error_fraction, d.version, d.error_class,
-                         'gpt-3.5-turbo']
-                    )
+                old_value = d.dataframe.iloc[(row, col)]
+                if old_value != '':
+                    if helpers.fetch_cache(d.name, (row, col), 'llm_master', d.error_fraction, d.version, d.error_class,
+                                           self.LLM_NAME_CORRFM) is None:
+                        df_row_with_error = d.dataframe.iloc[row, :].copy()
+                        prompt = helpers.llm_master_prompt((row, col), df_error_free_subset, df_row_with_error)
+                        fetch_llm_master_args.append(
+                            [prompt, old_value, d.name, (row, col), 'llm_master', gpt_session, d.error_fraction,
+                             d.version, d.error_class, self.LLM_NAME_CORRFM]
+                        )
 
             self.logger.debug(
                 f'Identified {len(fetch_llm_master_args)} llm_master corrections not yet cached. Fetching...')
 
             if len(fetch_llm_master_args) > 0:
-                llm_results = map(helpers.fetch_llm, *zip(*fetch_llm_master_args))
+                llm_results = map(helpers.generate_llm_response, *zip(*fetch_llm_master_args))
 
                 # Implement Producer-Consumer Pattern
                 ctx = get_context("spawn")
@@ -603,6 +695,7 @@ class Cleaning:
                 f'Fetched {len(fetch_llm_master_args)} llm_master corrections and added them to the cache.')
 
         if 'llm_correction' in self.FEATURE_GENERATORS:  # send all LLM-queries and add the to cache
+            # Producer-Consumer Pattern for llm_correction corrections
             error_correction_pairs: Dict[int, List[Tuple[str, str]]] = {}
             fetch_llm_correction_args = []
             # llm_results: List[helpers.LLMResult] = [] # TODO delete
@@ -625,10 +718,11 @@ class Cleaning:
                         col) is not None:  # Skip if there is no value to be transformed or no cleaning examples
                     if helpers.fetch_cache(d.name, (row, col), 'llm_correction', d.error_fraction, d.version,
                                            d.error_class, self.LLM_NAME_CORRFM) is None:
-                        prompt = helpers.llm_correction_prompt(old_value, error_correction_pairs[col])
+                        column_name, category = d.column_categories[col]
+                        prompt = helpers.llm_correction_prompt(old_value, error_correction_pairs[col], column_name, category)
                         fetch_llm_correction_args.append(
                             [prompt, old_value, d.name, (row, col), 'llm_correction', gpt_session, d.error_fraction,
-                             d.version, d.error_class, llm_name_corrfm]
+                             d.version, d.error_class, self.LLM_NAME_CORRFM]
                         )
 
             self.logger.debug(
@@ -1000,6 +1094,85 @@ class Cleaning:
             os.mkdir(ec_folder_path)
         pickle.dump(d, open(os.path.join(ec_folder_path, "correction.dataset"), "wb"))
 
+    def find_llm(self):
+        """
+        This methode asks the user which llm should be used, depending on the availabe Hardware and VRAM of the gpu, also
+        the user can decide between runtime and quality
+        @return:
+        """
+        if self.VERBOSE:
+            with ThreadPoolExecutor(max_workers=1) as executor:  # TODO funktioniert noch nicht wie gewünscht!
+                model_future: Future = executor.submit(
+                    lambda: GPT4All(  # TODO cuda Fehlermeldungen untersuchen / unterdrücken
+                        model_name=self.LLM_NAME_CORRFM,
+                        model_path="/home/gero/Schreibtisch/Bachelorarbeit/mimir/src/LLMs/",
+                        device='kompute',
+                        allow_download=False,
+                        verbose=True
+                    )
+                )
+                return model_future
+
+        llm_models = [
+            {"name": "Meta-Llama-3-8B-Instruct.Q4_0.gguf", "vram_gb": 4},
+            {"name": "Meta-Llama-3-8B-Instruct.Q4_0.gguf", "vram_gb": 8},
+            {"name": "mistral-7b-instruct-v0.2.Q4_0.gguf", "vram_gb": 16},
+            {"name": "mistral-7b-instruct-v0.2.Q4_0.gguf", "vram_gb": 24},
+        ]
+        gpus = GPT4All.list_gpus()
+        if not len(gpus) == 0:
+            x = 0
+            for gpu in gpus:
+                print(f"[{x}] {gpu}")
+                x += 1
+            gpu_id = input("Choose one of the shown GPU's to use for the correction: ")
+            device = gpus[int(gpu_id)]
+            vram_gb = int(input("What is the VRAM in GB of the chosen GPU (4,8,16,24)?: "))
+            suggestions = []
+            suitable_models = [model for model in llm_models if model["vram_gb"] <= vram_gb]
+            suggestions.append({
+                "gpu": device,
+                "vram": vram_gb,
+                "suggested_models": suitable_models
+            })
+            for suggestion in suggestions:
+                print(f"GPU: {suggestion['gpu']} ({suggestion['vram']:.2f} GB VRAM)")
+                if suggestion["suggested_models"]:
+                    print("  Suitable LLMs:")
+                    x = 0
+                    for model in suggestion["suggested_models"]:
+                        print(f"     [{x}]    - {model['name']} (requires {model['vram_gb']} GB VRAM)")
+                        x += 1
+
+                else:
+                    print("  No suitable LLMs found for this GPU.")
+            model_id = input("Choose a model ID: ")
+            model = llm_models[int(model_id)]
+            model_found = False
+            for entry in os.listdir("/home/gero/Schreibtisch/Bachelorarbeit/mimir/src/LLMs/"):
+                if entry == model['name']:  # Check for an exact match
+                    model_found = True
+            if not model_found:
+                allow_download = input("Should the model be downloaded? (y/n): ")
+                if allow_download == "n":
+                    return None
+                allow_download = allow_download == "y"
+        else:
+            device = 'cpu'
+            model = llm_models[0]
+
+        with ThreadPoolExecutor(max_workers=1) as executor:  # TODO funktioniert noch nicht wie gewünscht!
+            model_future: Future = executor.submit(
+                lambda: GPT4All(  # TODO cuda Fehlermeldungen untersuchen / unterdrücken
+                    model_name=model['name'],
+                    model_path="/home/gero/Schreibtisch/Bachelorarbeit/mimir/src/LLMs/",
+                    device=device,
+                    allow_download=allow_download,
+                    verbose=False
+                )
+            )
+        return model_future
+
     def run(self, d, random_seed: int, synchronous: bool):
         """
         This method runs Mimir on an input dataset to correct data errors. A random_seed introduces
@@ -1013,18 +1186,21 @@ class Cleaning:
         # This makes the sampling process deterministic.
         random.seed(random_seed)
 
-        with ThreadPoolExecutor(max_workers=1) as executor:     # TODO funktioniert noch nicht wie gewünscht!
-            model_future: Future = executor.submit(
-                lambda: GPT4All(                                # TODO cuda Fehlermeldungen untersuchen / unterdrücken
-                    model_name=self.LLM_NAME_CORRFM,
-                    model_path="/home/gero/Schreibtisch/Bachelorarbeit/mimir/src/LLMs/",
-                    device='kompute',
-                    allow_download=False,
-                    verbose=True
-                )
-            )
 
+        """
+        Das alles in eigene Methode auslagern. Fall, dass kein modell passt, fehlt noch und logischerweise der wichtigste Schritt,
+        den Fehlern einen Komplexitätsscore zu geben. 
+        
+        Vielleich ist auch das ganze vorher abgefrage sinnlos. Vielleicht sollte man einfach nur die Größe der GraKa abfragen oder halt
+        irgendwie ermitteln und dann sogar mit mehreren LLMs arbeiten. Oder halt dann automatisch erkennen welches LLM funktioniert.
+        Aber ganz ohne UserInput ists schlecht, der sollte schon entscheiden können ob er das beste oder schnellste oder einen automatischen
+        mittelweg haben möchte
+        """
+
+
+        model_future = self.find_llm()
         d = self.initialize_dataset(d)
+        self.categorize_columns(d)
         if len(d.detected_cells) == 0:
             raise ValueError('There are no errors in the data to correct.')
         if self.VERBOSE:
@@ -1057,7 +1233,7 @@ if __name__ == "__main__":
     # store results for detailed analysis
     dataset_analysis = True
 
-    dataset_name = "rayyan"
+    dataset_name = "flights"
     error_class = "simple_mcar"
     error_fraction = 3
     version = 1
@@ -1072,8 +1248,8 @@ if __name__ == "__main__":
     gpdep_threshold = 0.3
     training_time_limit = 90
     #feature_generators = ['auto_instance', 'fd', 'llm_correction', 'llm_master']
-    feature_generators = ['auto_instance', 'fd', 'llm_correction']
-    #feature_generators = ['llm_correction']
+    #feature_generators = ['auto_instance', 'fd', 'llm_correction']
+    feature_generators = ['llm_correction']
     #feature_generators = ['llm_master']
     classification_model = "ABC"
     fd_feature = 'norm_gpdep'
@@ -1097,6 +1273,6 @@ if __name__ == "__main__":
                      vicinity_feature_generator, auto_instance_cache_model, n_best_pdeps, training_time_limit,
                      synth_tuples, synth_cleaning_threshold, test_synth_data_direction, pdep_features, gpdep_threshold,
                      fd_feature, dataset_analysis, llm_name_corrfm, sampling_technique)
-    app.VERBOSE = True
+    app.VERBOSE = True # also switches real user correction to simulated user correction with ground truth AND user can choose with model to use
     random_seed = 0
-    correction_dictionary = app.run(data, random_seed, synchronous=True) # TODO synchronous kann vermutlich raus?
+    correction_dictionary = app.run(data, random_seed, synchronous=False) # TODO synchronous kann vermutlich raus?

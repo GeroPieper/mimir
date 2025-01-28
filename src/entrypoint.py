@@ -11,7 +11,7 @@ import dotenv
 import dataset
 import correction
 
-def run_mirmir(c: dict):
+def run_mimir(c: dict):
     """
     Runs mirmir with a configuration as specified in c.
     @param c: a dictionary that contains all parameters the experiment requires.
@@ -161,7 +161,7 @@ if __name__ == "__main__":
         for i, config in enumerate(tqdm(configs)):
             experiment_id = f'{args.saved_config}-{i}'
             experiment_id = experiment_id.replace('_', '-')
-            result = run_mirmir(config)
+            result = run_mimir(config)
             with open(results_path / f"{experiment_id}.json", 'wt') as f:
                 json.dump(result, f)
     else:  # k8s mode
@@ -169,6 +169,6 @@ if __name__ == "__main__":
             raise ValueError('config or experiment_id ENV VARs are not set')
         config = json.loads(os.getenv('CONFIG'))
         experiment_id = os.getenv('EXPERIMENT_ID')
-        result = run_mirmir(config)
+        result = run_mimir(config)
         with open(results_path / f"{experiment_id}.json", 'wt') as f:
             json.dump(result, f)
