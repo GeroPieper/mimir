@@ -1,11 +1,14 @@
 import json
 import random
 import sqlite3
+import time
+
 import numpy as np
 from typing import Union, Dict, Tuple, List
 from dataclasses import dataclass
 from collections import defaultdict
 
+import requests
 import torch
 import torch.nn.functional as F
 
@@ -248,7 +251,106 @@ def fetch_cache(dataset: str,
     return None
 
 
-def generate_llm_response(prompt: Union[str, None],
+def generate_llm_response(
+    prompt: Union[str, None],
+    old_value: str,
+    dataset: str,
+    error_cell: Tuple[int, int],
+    correction_model_name: str,
+    gpt_session,
+    error_fraction: Union[None, int] = None,
+    version: Union[None, int] = None,
+    error_class: Union[None, str] = None,
+    llm_name: str = "Meta-Llama-3-8B-Instruct.Q4_0.gguf"
+) -> Union[LLMResult, None]:
+    """
+    Generiert eine Antwort mit llama.cpp über den REST-Server.
+    """
+
+    # Falls kein Prompt vorhanden ist, macht eine Anfrage keinen Sinn
+    if not prompt:
+        return None
+
+    llama_url = "http://localhost:8080/completion"
+
+    payload = {
+        "model": llm_name,
+        "prompt": prompt,
+        "n_predict": len(old_value),
+        "n_probs": len(old_value),
+        "stream": False,
+        "return_tokens": True
+    }
+
+    try:
+        response = send_request_with_retry(llama_url=llama_url, payload=payload, timeout=60, max_retries=3)
+        # falls anderer Fehler als 503 geworfen wird
+        response.raise_for_status()
+
+        response_data = response.json()
+
+        choices = response_data['choices'][0]
+
+        # Hier filtern nach dem 'token'
+        filtered_content = [item for item in choices['logprobs']['content']
+                            if item['token'] != '\n']
+
+        correction_tokens = [y['token'] for y in filtered_content]
+        token_logprobs = [y['logprob'] for y in filtered_content]
+        top_logprobs = [
+            {p['token']: p['logprob'] for p in item['top_logprobs']}
+            for item in filtered_content
+        ]
+
+        print(f"correction_tokens {correction_tokens}")
+        print(f"token_logprobs {token_logprobs}")
+        print(f"top_logprobs {top_logprobs}")
+    except requests.RequestException as e:
+        print(f"Fehler bei der Anfrage an llama.cpp-Server: {e}")
+        return None
+
+    row, column = error_cell
+    llm_result = LLMResult(dataset, row, column, correction_model_name, correction_tokens, token_logprobs, top_logprobs,
+                           error_fraction, version, error_class, llm_name)
+    return llm_result
+
+
+def send_request_with_retry(llama_url, payload, timeout, max_retries):
+    """
+    Sendet ein Prompt-Payload an llama.cpp und versucht bei 503 (Loading model)
+    mehrmals, die Anfrage erneut abzuschicken.
+    """
+
+    for attempt in range(max_retries):
+        response = requests.post(llama_url, json=payload, timeout=timeout)
+
+        if response.status_code != 503:
+            return response
+
+        # Falls Status 503, schauen wir ins JSON
+        try:
+            data = response.json()
+        except ValueError:
+            # Falls kein gültiges JSON zurückkommt, brechen wir ab
+            return response
+
+        error = data.get("error", {})
+
+        # Prüfen, ob "Loading model" als Grund angegeben ist
+        if (error.get("code") == 503 and
+                error.get("message") == "Loading model"):
+            print(f"Server meldet: {error.get('message')}. "
+                  f"Versuch {attempt + 1} von {max_retries}, warte 3s ...")
+            time.sleep(3)
+            # Dann erneut versuchen
+        else:
+            # Irgendein anderer 503-Fehler
+            return response
+
+    # Nach max_retries wird die letzte response zurückgegeben
+    return response
+
+"""def generate_llm_response(prompt: Union[str, None],
               old_value: str,
               dataset: str,
               error_cell: Tuple[int, int],
@@ -260,9 +362,9 @@ def generate_llm_response(prompt: Union[str, None],
               #llm_name: str = "gpt-3.5-turbo"
               llm_name: str = "Meta-Llama-3-8B-Instruct.Q4_0.gguf"
               ) -> Union[LLMResultGPT4All, None]:
-    """
+    
     Generiert eine Antwort mit GPT4All.
-    """
+    
     try:
         response = gpt_session.generate_response(prompt, len(old_value))  # ist nur eine Annäherung an die benötigten Token
         response_text = response.split('\n', 1)[0]
@@ -279,7 +381,7 @@ def generate_llm_response(prompt: Union[str, None],
     llm_result = LLMResultGPT4All(prompt, dataset, row, column, response_text, correction_model_name,
                            error_fraction, version, error_class, llm_name)
     return llm_result
-
+"""
 def compute_token_logprobs(llm_result: LLMResultGPT4All) -> LLMResult | None:
     """
     Berechnet die Token-Logwahrscheinlichkeiten und Top-Logwahrscheinlichkeiten für eine Antwort.

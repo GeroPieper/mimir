@@ -3,6 +3,7 @@ import json
 import pickle
 import random
 import difflib
+import subprocess
 import threading
 import unicodedata
 import multiprocessing
@@ -13,6 +14,7 @@ import numpy as np
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 # from queue import Queue
 from multiprocessing import get_context, Queue
+import docker
 
 import re
 import pandas as pd
@@ -29,8 +31,6 @@ from datetime import timedelta
 import math
 import concurrent.futures
 from gpt4all import GPT4All
-from joblib.externals.loky.backend.queues import Queue
-from numba.core.cgutils import true_bit
 from pandas import Series
 
 import dataset
@@ -729,6 +729,24 @@ class Cleaning:
                 f'Identified {len(fetch_llm_correction_args)} llm_correction corrections not yet cached. Fetching...')
 
             if len(fetch_llm_correction_args) > 0:
+                if synchronous:
+                    llm_results = map(helpers.generate_llm_response, *zip(*fetch_llm_correction_args))
+                else:
+                    chunksize = len(fetch_llm_correction_args) // min(len(fetch_llm_correction_args), n_workers)
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+                        llm_results = executor.map(helpers.generate_llm_response, *zip(*fetch_llm_correction_args),
+                                                   chunksize=chunksize)
+
+            for llm_result in llm_results:
+                if llm_result is not None:
+                    helpers.insert_llm_into_cache(llm_result)
+                else:
+                    self.logger.debug('Unable to fetch llm_correction result.')
+            self.logger.debug(
+                f'Fetched {len(fetch_llm_correction_args)} llm_correction corrections and added them to the cache.')
+
+
+            """if len(fetch_llm_correction_args) > 0:
                 llm_results = map(helpers.generate_llm_response, *zip(*fetch_llm_correction_args))
 
                 ctx = get_context("spawn")
@@ -757,7 +775,7 @@ class Cleaning:
                 consumer_thread.start()
 
                 producer_thread.join()
-                consumer_thread.join()
+                consumer_thread.join()"""
 
             self.logger.debug(
                 f'Fetched {len(fetch_llm_correction_args)} llm_correction corrections and added them to the cache.')
@@ -1105,8 +1123,8 @@ class Cleaning:
                 model_future: Future = executor.submit(
                     lambda: GPT4All(  # TODO cuda Fehlermeldungen untersuchen / unterdrücken
                         model_name=self.LLM_NAME_CORRFM,
-                        model_path="/home/gero/Schreibtisch/Bachelorarbeit/mimir/src/LLMs/",
-                        device='kompute',
+                        model_path="/Users/gero/Desktop lokal/Bachelor/mimir/src/LLMs",
+                        device='cpu',
                         allow_download=False,
                         verbose=True
                     )
@@ -1173,6 +1191,45 @@ class Cleaning:
             )
         return model_future
 
+    def start_llama_server(self):
+        """
+        Startet den nativ gebauten llama.cpp-Server als Subprozess.
+        """
+        # TODO hardcoded ändern, wichtig ist der Teil bis "/Users/gero/Desktop lokal/Bachelor/mimir", der rest ist logisch
+        server_path = "/Users/gero/Desktop lokal/Bachelor/mimir/llama.cpp/build/bin/llama-server"
+        model_path = f"/Users/gero/Desktop lokal/Bachelor/mimir/src/models/{self.LLM_NAME_CORRFM}"
+
+        # TODO Kommandozeilenargumente anders schicken ./ funktioniert aber der absolute Pfad funktioniert nicht
+
+        # Kommandozeilenargumente für den Server
+        cmd = [
+            server_path,
+            "--model", model_path,
+            ""
+            "--temp", "0",
+            "--top-k", "1",
+            # TODO vielleicht auch noch mii min-p-sampling arbeiten?
+            # TODO hardcoded
+            "--n-gpu-layers", "28",
+            "--ctx-size", "4096",
+        ]
+
+        # Den Server starten und im Hintergrund laufen lassen
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.logger.debug("llama.cpp-Server wird gestartet...")
+
+        # Kurze Pause, um dem Server Zeit zu geben, hochzufahren => sonst kommen nur Fehlermeldungen mit "model loading"
+        time.sleep(9)
+        return process
+
+    def stop_llama_server(self, process):
+        """
+        Stoppt den laufenden llama.cpp-Server.
+        """
+        process.terminate()  # Signal zum Beenden senden
+        process.wait()
+        self.logger.debug("llama.cpp-Server wurde gestoppt.")
+
     def run(self, d, random_seed: int, synchronous: bool):
         """
         This method runs Mimir on an input dataset to correct data errors. A random_seed introduces
@@ -1197,8 +1254,9 @@ class Cleaning:
         mittelweg haben möchte
         """
 
+        # llama.cpp-Server starten
+        server_process = self.start_llama_server()
 
-        model_future = self.find_llm()
         d = self.initialize_dataset(d)
         self.categorize_columns(d)
         if len(d.detected_cells) == 0:
@@ -1212,10 +1270,10 @@ class Cleaning:
 
         self.draw_synth_error_positions(d)
 
-        model = model_future.result()
-        gpt_session = helpers.GPT4AllModelSession(model)
+        """model = model_future.result()
+        gpt_session = helpers.GPT4AllModelSession(model)"""
 
-        self.prepare_augmented_models(d, gpt_session, synchronous)
+        self.prepare_augmented_models(d, None, synchronous)
         self.generate_features(d, synchronous)
         self.generate_inferred_features(d, synchronous)
         self.binary_predict_corrections(d)
@@ -1226,6 +1284,7 @@ class Cleaning:
             self.logger.info(
                 "Cleaning performance on {}:\nPrecision = {:.2f}\nRecall = {:.2f}\nF1 = {:.2f}\n".format(d.name, p, r,
                                                                                                         f))
+        self.stop_llama_server(server_process)
         return d.corrected_cells
 
 
@@ -1233,7 +1292,7 @@ if __name__ == "__main__":
     # store results for detailed analysis
     dataset_analysis = True
 
-    dataset_name = "flights"
+    dataset_name = "rayyan"
     error_class = "simple_mcar"
     error_fraction = 3
     version = 1
@@ -1260,7 +1319,7 @@ if __name__ == "__main__":
     test_synth_data_direction = 'user_data'
     #llm_name_corrfm = "gpt-4-turbo"  # only use this for tax, because experiments get expensive :)
     #llm_name_corrfm = "gpt-3.5-turbo"
-    llm_name_corrfm = "Meta-Llama-3-8B-Instruct.Q4_0.gguf"
+    llm_name_corrfm = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
     sampling_technique = 'greedy'
 
     # Set this parameter to keep runtimes low when debugging
@@ -1273,6 +1332,6 @@ if __name__ == "__main__":
                      vicinity_feature_generator, auto_instance_cache_model, n_best_pdeps, training_time_limit,
                      synth_tuples, synth_cleaning_threshold, test_synth_data_direction, pdep_features, gpdep_threshold,
                      fd_feature, dataset_analysis, llm_name_corrfm, sampling_technique)
-    app.VERBOSE = True # also switches real user correction to simulated user correction with ground truth AND user can choose with model to use
+    app.VERBOSE = True # also switches real user correction to simulated user correction with ground truth AND user can choose which model to use
     random_seed = 0
-    correction_dictionary = app.run(data, random_seed, synchronous=False) # TODO synchronous kann vermutlich raus?
+    correction_dictionary = app.run(data, random_seed, synchronous=True) # TODO synchronous kann vermutlich raus?

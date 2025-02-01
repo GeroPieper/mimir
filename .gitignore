@@ -25,3 +25,4 @@ src/analysis/
 
 # measurement results
 src/measurements/*
+/llama.cpp/
