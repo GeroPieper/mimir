@@ -629,12 +629,9 @@ class Cleaning:
                                                                             pdep_tuple.gpdep,
                                                                             pdep_tuple.epdep,
                                                                             pdep_tuple.gpdep / norm_sum)
-            #self.logger.debug('')
 
         if 'llm_master' in self.FEATURE_GENERATORS:
-            # Producer-Consumer Pattern for llm_master corrections
             fetch_llm_master_args = []
-            # llm_master_results: List[helpers.LLMResult] = [] # TODO delete
 
             # Prepare clean data subset for context
             inputted_rows = list(d.labeled_tuples.keys())
@@ -667,6 +664,7 @@ class Cleaning:
                 ctx = get_context("spawn")
                 queue = ctx.Queue()
 
+                # Producer-Consumer Pattern for llm_correction corrections
                 def producer(llm_results, queue):
                     for llm_result in llm_results:
                         if llm_result is not None:
@@ -695,10 +693,8 @@ class Cleaning:
                 f'Fetched {len(fetch_llm_master_args)} llm_master corrections and added them to the cache.')
 
         if 'llm_correction' in self.FEATURE_GENERATORS:  # send all LLM-queries and add the to cache
-            # Producer-Consumer Pattern for llm_correction corrections
             error_correction_pairs: Dict[int, List[Tuple[str, str]]] = {}
             fetch_llm_correction_args = []
-            # llm_results: List[helpers.LLMResult] = [] # TODO delete
 
             # Construct pairs of ('error', 'correction') per column by iterating over the user input.
             for cell in d.labeled_cells:
@@ -734,6 +730,7 @@ class Cleaning:
                 ctx = get_context("spawn")
                 queue = ctx.Queue()
 
+                # Producer-Consumer Pattern for llm_correction corrections
                 def producer(llm_results, queue):
                     for llm_result in llm_results:
                         if llm_result is not None:
@@ -1250,7 +1247,6 @@ if __name__ == "__main__":
     #feature_generators = ['auto_instance', 'fd', 'llm_correction', 'llm_master']
     #feature_generators = ['auto_instance', 'fd', 'llm_correction']
     feature_generators = ['llm_correction']
-    #feature_generators = ['llm_master']
     classification_model = "ABC"
     fd_feature = 'norm_gpdep'
     vicinity_orders = [1]
@@ -1258,8 +1254,6 @@ if __name__ == "__main__":
     vicinity_feature_generator = "naive"
     pdep_features = ['pr']
     test_synth_data_direction = 'user_data'
-    #llm_name_corrfm = "gpt-4-turbo"  # only use this for tax, because experiments get expensive :)
-    #llm_name_corrfm = "gpt-3.5-turbo"
     llm_name_corrfm = "Meta-Llama-3-8B-Instruct.Q4_0.gguf"
     sampling_technique = 'greedy'
 
@@ -1273,6 +1267,6 @@ if __name__ == "__main__":
                      vicinity_feature_generator, auto_instance_cache_model, n_best_pdeps, training_time_limit,
                      synth_tuples, synth_cleaning_threshold, test_synth_data_direction, pdep_features, gpdep_threshold,
                      fd_feature, dataset_analysis, llm_name_corrfm, sampling_technique)
-    app.VERBOSE = True # also switches real user correction to simulated user correction with ground truth AND user can choose with model to use
+    app.VERBOSE = True  # also switches real user correction to simulated user correction with ground truth AND user can choose which model to use
     random_seed = 0
-    correction_dictionary = app.run(data, random_seed, synchronous=False) # TODO synchronous kann vermutlich raus?
+    correction_dictionary = app.run(data, random_seed, synchronous=True)  # When using llm_master or llm_correction 'synchronous' must be true
