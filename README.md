@@ -1,4 +1,16 @@
-# Mimir: A Holistic Error Correction System
+# Mimir++: An Advanced Data Repairing System
+
+Mimir++ is an extended version of Mimir, where the request to the OpenAI API for RD_ImpFM and ET_CorrFM is redirected to a local llama.cpp server. In addition, ET_CorrFM has been enhanced with multi-layer transformation analysis, allowing large datasets or those with many errors to be corrected by a local LLM within a practical runtime. The rest of Mimir remains unchanged. Mimir++ was developed as part of a bachelor thesis. Therefore, many thanks to Philipp for allowing me to use Mimir as a basis for my thesis and for the support! :)
+
+The llama.cpp server can be imported with the script 'build_llama_server.sh'. This script clones the llama.cpp repo and builds the server.
+In addition to the llama.cpp server, LMStudio for multi-layer transformation analysis (llm_transformation) is currently required to host the reasoning model. Since the llama.cpp server did not support stable execution of a reasoning model at the end of development, once it does, the request can be sent directly to the llama.cpp server instead of the LMStudio server.
+
+I also exported my conda environment (environment2.yml) because the environment.yml didnt not work for me.
+
+I recommend 'Meta-Llama-3.1-8B-Instruct-Q6_K_L' for RD_ImpFM and ET_CorrFM and 'DeepSeek-R1-Distill-Qwen-14B-Q4_K_M' with 'Codestral-22B-v0.1-Q2_K.gguf' for the multilayer transformation analysis. For slightly lower quality (F1 ~-0.02), 'Llama-3.2-1B-Instruct-F16.gguf' has amazing quality for its size and is very fast.
+
+Below is Mimir's ReadME with further installation instructions:  
+
 Mimir is a state-of-the-art error correction system.
 ![Schematic view of the Mimir error correction system](notebook/img/mimir.png)
 
