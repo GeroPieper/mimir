@@ -318,7 +318,7 @@ def llm_test_user_corrections(llm_name: str, session: requests.Session, pairs: l
 
 def generate_llm_response(
         prompt: Union[str, None],
-        old_value: str,
+        response_length: int,
         dataset: str,
         error_cell: Tuple[int, int],
         correction_model_name: str,
@@ -341,10 +341,10 @@ def generate_llm_response(
     payload: dict[str, Any] = {
         "model": llm_name,
         "prompt": prompt,
-        "n_predict": len(old_value),
-        "n_probs": len(old_value),
+        "n_predict": response_length,
+        "n_probs": response_length,
         "stream": False,
-        "return_tokens": True
+        "return_tokens": True,
     }
 
     try:
@@ -759,7 +759,6 @@ def llm_correction_prompt(old_value: str, error_correction_pairs: List[Tuple[str
     """
     Generate the llm_correction prompt sent to the LLM.
     """
-
     prompt = ("You are a data cleaning machine that detects patterns to return a correction. If you do "
               "not find a correction, you return the token <NULL>. You always follow the example and "
               "return NOTHING but the correction, <MV> or <NULL>.\n---\n"
@@ -786,22 +785,23 @@ def llm_correction_prompt(old_value: str, error_correction_pairs: List[Tuple[str
 
 
 def llm_master_prompt(cell: Tuple[int, int], df_error_free_subset: pd.DataFrame,
-                      df_row_with_error: pd.DataFrame) -> str:
+                      df_row_with_error: pd.DataFrame) -> str and int:
     """
     Generate the llm_master prompt sent to the LLM.
     """
-
     prompt = "You are a data cleaning machine that returns a correction, which is a single expression. If " \
              "you do not find a correction, return the token <NULL>. You always follow the example.\n---\n"
     n_pairs = min(5, len(df_error_free_subset))
     rows = random.sample(range(len(df_error_free_subset)), n_pairs)
+    max_length: int = 0
     for row in rows:
         row_as_string, correction = error_free_row_to_prompt(df_error_free_subset, row, cell[1])
+        if len(correction) > max_length: max_length = len(correction)
         prompt = prompt + row_as_string + '\n' + f'correction:{correction}' + '\n'
     final_row_as_string, _ = error_free_row_to_prompt(df_row_with_error, 0, cell[1])
     prompt = prompt + final_row_as_string + '\n' + 'correction:'
 
-    return prompt
+    return prompt, max_length
 
 
 def llm_recognize_correction_prompt(error_correction_pairs: List[Tuple[str, str]]) -> str:

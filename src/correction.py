@@ -54,19 +54,6 @@ class Cleaning:
     Class that carries out the error correction process.
     """
 
-    # TODO vor hochladen entfernen
-    time_llm_master: float = 0
-    llm_master_errors: int = 0
-    llm_master_errors_corrected: int = 0
-    time_llm_transformation: float = 0
-    llm_transformation_columns: int = 0
-    llm_transformation_errors: int = 0
-    llm_transformation_errors_corrected: int = 0
-    time_llm_correction: float = 0
-    llm_correction_errors: int = 0
-    llm_correction_errors_corrected: int = 0
-    time_correction: float = 0
-
     def __init__(self,
                  labeling_budget: int,
                  classification_model: str = 'ABC',
@@ -74,10 +61,11 @@ class Cleaning:
                  feature_generators: List[str] = ['auto_instance', 'fd', 'llm_correction', 'llm_master',
                                                   'llm_transformation'],
                  last_try_threshold: float = 1.0,
-                 llm_temp: int = 0,
+                 llm_temp: float = 0,
                  llm_top_k: int = 1,
                  llm_gpu_layers: int = 48,
                  llm_ctx_size: int = 4096,
+                 use_llm_master_for_mv = False,
                  vicinity_orders: List[int] = [1],
                  vicinity_feature_generator: str = 'naive',
                  auto_instance_cache_model: bool = False,
@@ -107,6 +95,7 @@ class Cleaning:
         @param llm_top_k: top_k for the llm used in 'llm_master', 'llm_correction', 'llm_transformation'.
         @param llm_gpu_layers: Number of layers used by llm on the gpu
         @param llm_ctx_size: Context size for the llm
+        @param use_llm_master_for_mv: Toggles if llm_master should be used for missing values (value = '', no placeholder).
         @param vicinity_orders: The pdep approach enables the usage of higher-order dependencies to clean data. Each
         order used is passed as an integer, e.g. [1, 2]. Unary dependencies would be used by passing [1] for example.
         @param vicinity_feature_generator: How vicinity features are generated. Either 'pdep' or 'naive'. Baran uses
@@ -144,6 +133,7 @@ class Cleaning:
         self.LLM_TOP_K = llm_top_k
         self.LLM_GPU_LAYERS = llm_gpu_layers
         self.LLM_CTX_SIZE = llm_ctx_size
+        self.USE_LLM_MASTER_FOR_MV = use_llm_master_for_mv
         self.VICINITY_ORDERS = vicinity_orders
         self.VICINITY_FEATURE_GENERATOR = vicinity_feature_generator
         self.AUTO_INSTANCE_CACHE_MODEL = auto_instance_cache_model
@@ -667,10 +657,6 @@ class Cleaning:
             # self.logger.debug('')
 
         if 'llm_master' in self.FEATURE_GENERATORS:
-            # TODO entfernen
-            start_time = time.time()
-
-
             fetch_llm_master_args = []
 
             # Prepare clean data subset for context
@@ -684,15 +670,20 @@ class Cleaning:
             # Construct prompts for each detected cell
             for (row, col) in d.detected_cells:
                 old_value = d.dataframe.iloc[(row, col)]
-                if old_value != '':
-                    if helpers.fetch_cache(d.name, (row, col), 'llm_master', d.error_fraction, d.version, d.error_class,
-                                           self.LLM_NAME_CORRFM) is None:
-                        df_row_with_error = d.dataframe.iloc[row, :].copy()
-                        prompt = helpers.llm_master_prompt((row, col), df_error_free_subset, df_row_with_error)
-                        fetch_llm_master_args.append(
-                            [prompt, old_value, d.name, (row, col), 'llm_master', session, d.error_fraction,
-                             d.version, d.error_class, self.LLM_NAME_CORRFM]
-                        )
+                use_max_length: bool = False
+                if old_value == '':
+                    if self.USE_LLM_MASTER_FOR_MV:
+                        use_max_length = True
+                    else:
+                        continue
+                if helpers.fetch_cache(d.name, (row, col), 'llm_master', d.error_fraction, d.version, d.error_class, self.LLM_NAME_CORRFM) is None:
+                    df_row_with_error = d.dataframe.iloc[row, :].copy()
+                    prompt, max_length = helpers.llm_master_prompt((row, col), df_error_free_subset, df_row_with_error)
+                    response_length = max_length if use_max_length else len(old_value)
+                    fetch_llm_master_args.append(
+                        [prompt, response_length, d.name, (row, col), 'llm_master', session, d.error_fraction,
+                         d.version, d.error_class, self.LLM_NAME_CORRFM]
+                    )
 
             self.logger.debug(
                 f'Identified {len(fetch_llm_master_args)} llm_master corrections not yet cached. Fetching...')
@@ -713,16 +704,7 @@ class Cleaning:
             self.logger.debug(
                 f'Fetched {len(fetch_llm_master_args)} llm_master corrections and added them to the cache.')
 
-            # TODO entfernen
-            end_time = time.time()
-            self.time_llm_master = end_time - start_time
-            self.llm_master_errors = len(fetch_llm_master_args)
-            self.llm_master_errors_corrected = len(fetch_llm_master_args)
-
         if 'llm_transformation' in self.FEATURE_GENERATORS:  # try to find a Transformation for each column with a llm
-            # TODO entfernen
-            start_time = time.time()
-
             error_correction_pairs: dict[int, List[Tuple[str, str]]] = {}
             # step 1:
             # Construct pairs of ('error', 'correction') per column by iterating over the user input.
@@ -761,13 +743,13 @@ class Cleaning:
                             for pair in failed_pairs:
                                 failed_pairs_dict[column].append(pair)
 
-            # if a column has more than 75% of all errors, the transformation analysis will be tried anyway
+            # if a column has more than 75% errors of all errors, >200 errors and >5 error-correction pairs , the transformation analysis will be tried anyway
             for column in error_counts:
                 error_count = error_counts[column]
-                if (error_count / len(d.detected_cells)) >= 0.75:
-                    if column not in columns_for_llm_transformation and not helpers.is_column_in_cache(d.name, column,
-                                                                                                       'llm_correction',
-                                                                                                       self.LLM_NAME_CORRFM):
+                if (error_count / len(d.detected_cells)) >= 0.75 and error_count > 200:
+                    if (column not in columns_for_llm_transformation
+                            and not helpers.is_column_in_cache(d.name, column, 'llm_correction', self.LLM_NAME_CORRFM)
+                            and len(error_correction_pairs.get(column, {})) >= 5):
                         columns_for_llm_transformation.append(column)
 
             self.logger.debug(f"Identified {len(columns_for_llm_transformation)} columns for llm_transformation.")
@@ -930,17 +912,7 @@ class Cleaning:
             if len(columns_for_llm_transformation) > 0:
                 self.stop_lmstudio_server(server_process)
 
-            # TODO entfernen
-            end_time = time.time()
-            self.time_llm_transformation = end_time - start_time
-            self.llm_transformation_errors = total_errors
-            self.llm_transformation_errors_corrected = total_corrections
-            self.llm_transformation_columns = len(columns_for_llm_transformation)
-
         if 'llm_correction' in self.FEATURE_GENERATORS:  # send all LLM-queries and add the to cache
-            # TODO entfernen
-            start_time = time.time()
-
             error_correction_pairs: dict[int, List[Tuple[str, str]]] = {}
             fetch_llm_correction_args = []
             if column_corrected_list is None:
@@ -974,7 +946,8 @@ class Cleaning:
                             prompt = helpers.llm_correction_prompt(old_value, error_correction_pairs[col], column_name,
                                                                    category)
                             fetch_llm_correction_args.append(
-                                [prompt, old_value, d.name, (row, col), 'llm_correction', session, d.error_fraction,
+                                [prompt, len(old_value), d.name, (row, col), 'llm_correction', session,
+                                 d.error_fraction,
                                  d.version, d.error_class, self.LLM_NAME_CORRFM]
                             )
 
@@ -995,15 +968,9 @@ class Cleaning:
                         helpers.insert_llm_into_cache(llm_result)
                     else:
                         self.logger.debug('Unable to fetch llm_correction result.')
-                self.logger.debug(
-                    f'Fetched {len(fetch_llm_correction_args)} llm_correction corrections and added them to the cache.')
+            self.logger.debug(
+                f'Fetched {len(fetch_llm_correction_args)} llm_correction corrections and added them to the cache.')
             self.stop_llama_server(server_process)
-
-            # TODO entfernen
-            end_time = time.time()
-            self.time_llm_correction = end_time - start_time
-            self.llm_correction_errors = len(fetch_llm_correction_args)
-            self.llm_correction_errors_corrected = len(fetch_llm_correction_args)
 
         if 'auto_instance' in self.FEATURE_GENERATORS:
             self.logger.debug('Start training DataWig Models.')
@@ -1448,7 +1415,7 @@ class Cleaning:
         except subprocess.CalledProcessError as e:
             self.logger.error(f"Error stopping LM Studio Server: {e}")
 
-    def start_llama_server(self, llm_name: str, gpu_layers: int, ctx_size: int, temp: int, top_k: int) \
+    def start_llama_server(self, llm_name: str, gpu_layers: int, ctx_size: int, temp: float, top_k: int) \
             -> Tuple[subprocess.Popen, requests.Session]:
         """
         Startet den nativ gebauten llama.cpp-Server als Subprozess und gibt den Prozess sowie eine konfigurierte Requests-Session zurück..
@@ -1510,20 +1477,6 @@ class Cleaning:
         # This makes the sampling process deterministic.
         random.seed(random_seed)
 
-        """
-        Das alles in eigene Methode auslagern. Fall, dass kein modell passt, fehlt noch und logischerweise der wichtigste Schritt,
-        den Fehlern einen Komplexitätsscore zu geben. 
-        
-        Vielleich ist auch das ganze vorher abgefrage sinnlos. Vielleicht sollte man einfach nur die Größe der GraKa abfragen oder halt
-        irgendwie ermitteln und dann sogar mit mehreren LLMs arbeiten. Oder halt dann automatisch erkennen welches LLM funktioniert.
-        Aber ganz ohne UserInput ists schlecht, der sollte schon entscheiden können ob er das beste oder schnellste oder einen automatischen
-        mittelweg haben möchte
-        """
-
-        # TODO entfernen
-        start_time = time.time()
-        self.logger.setLevel(logging.INFO)
-
         d = self.initialize_dataset(d)
         self.categorize_columns(d)
         if len(d.detected_cells) == 0:
@@ -1543,37 +1496,22 @@ class Cleaning:
         self.binary_predict_corrections(d)
         self.clean_with_user_input(d)
 
-        # TODO entfernen
-        end_time = time.time()
-        self.time_correction = end_time - start_time
-
         if self.VERBOSE:
             p, r, f = d.get_data_cleaning_evaluation(d.corrected_cells)[-3:]
             self.logger.info(
                 "Cleaning performance on {}:\nPrecision = {:.2f}\nRecall = {:.2f}\nF1 = {:.2f}\n".format(d.name, p, r,
                                                                                                          f))
 
-            # TODO entfernen
-            self.logger.info(f"Time for llm_master: {self.time_llm_master}")
-            self.logger.info(f"corrected {self.llm_master_errors_corrected} of {self.llm_master_errors}")
-            self.logger.info(f"Time for llm_transformation: {self.time_llm_transformation}")
-            self.logger.info(f"corrected {self.llm_transformation_columns} columns with llm_transformation")
-            self.logger.info(f"that are {self.llm_transformation_errors_corrected} of {self.llm_transformation_errors}")
-            self.logger.info(f"Time for llm_correction: {self.time_llm_correction}")
-            self.logger.info(f"corrected {self.llm_correction_errors_corrected} of {self.llm_correction_errors}")
-            self.logger.info(f"Time for correction: {self.time_correction}")
-
         return d.corrected_cells
 
 
-# TODO am Ende wieder entfernen
-def main(dataset_str: str, error_fraction_int: int, feature_generators: list, llm_name_corrfm: str):
+if __name__ == '__main__':
     # store results for detailed analysis
     dataset_analysis = True
 
-    dataset_name = dataset_str
-    error_class = "simple_mcar"
-    error_fraction = error_fraction_int
+    dataset_name = "rayyan"
+    error_class = "imputer_simple_mcar"
+    error_fraction = 5
     version = 1
     n_rows = None
 
@@ -1584,12 +1522,13 @@ def main(dataset_str: str, error_fraction_int: int, feature_generators: list, ll
     clean_with_user_input = True  # Careful: If set to False, d.corrected_cells will remain empty.
     gpdep_threshold = 0.3
     training_time_limit = 90
-    feature_generators = feature_generators
+    feature_generators = ['auto_instance', 'fd', 'llm_master', 'llm_transformation', 'llm_correction']
     last_try_threshold = 0.8  # if 1.0 last_try is off, if less than 1.0 it functions as the minimum precision needed for a valid transformation, less than 0.8 isn't recommended
-    llm_temp = 0  # temp for the llm used in llm_master, llm_transformation, llm_correction
-    llm_top_k = 1  # top_k for the llm used in llm_master, llm_transformation, llm_correction
+    llm_temp = 0.1  # temp for the llm used in llm_master, llm_transformation, llm_correction
+    llm_top_k = 5  # top_k for the llm used in llm_master, llm_transformation, llm_correction
     gpu_layers = 48  # gpu layers used by the llm on the gpu
     ctx_size = 4096  # size of the context window of the llm
+    use_llm_master_for_mv = False  # toggles if llm_master should be used for missing values (value = '', no placeholder)
     classification_model = "ABC"
     fd_feature = 'norm_gpdep'
     vicinity_orders = [1]
@@ -1597,7 +1536,7 @@ def main(dataset_str: str, error_fraction_int: int, feature_generators: list, ll
     vicinity_feature_generator = "naive"
     pdep_features = ['pr']
     test_synth_data_direction = 'user_data'
-    llm_name_corrfm = llm_name_corrfm  # for llm_transformation are two more llm's necessary: 'DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf' and 'Codestral-22B-v0.1-Q2_K.gguf'
+    llm_name_corrfm = "Meta-Llama-3.1-8B-Instruct-Q6_K_L.gguf"  # for llm_transformation are two more llm's necessary: 'DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf' and 'Codestral-22B-v0.1-Q2_K.gguf'
     sampling_technique = 'greedy'
 
     # Set this parameter to keep runtimes low when debugging
@@ -1607,7 +1546,7 @@ def main(dataset_str: str, error_fraction_int: int, feature_generators: list, ll
     logging.info(f'Initialized dataset {dataset_name}')
 
     app = Cleaning(labeling_budget, classification_model, clean_with_user_input, feature_generators, last_try_threshold,
-                   llm_temp, llm_top_k, gpu_layers, ctx_size, vicinity_orders,
+                   llm_temp, llm_top_k, gpu_layers, ctx_size, use_llm_master_for_mv, vicinity_orders,
                    vicinity_feature_generator, auto_instance_cache_model, n_best_pdeps, training_time_limit,
                    synth_tuples, synth_cleaning_threshold, test_synth_data_direction, pdep_features, gpdep_threshold,
                    fd_feature, dataset_analysis, llm_name_corrfm, sampling_technique)
@@ -1615,152 +1554,3 @@ def main(dataset_str: str, error_fraction_int: int, feature_generators: list, ll
     random_seed = 0
     correction_dictionary = app.run(data, random_seed,
                                     synchronous=True)  # when using llm_master, llm_transformation or llm_correction, synchronous must be True
-
-
-if __name__ == "__main__":
-    main("glass", 1, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], "Meta-Llama-3.1-8B-Instruct-Q6_K_L.gguf")
-"""
-    list_name_corrfm: list = ["Llama-3.2-3B-Instruct.fp16.gguf", "Llama-3.2-3B-Instruct.Q4_K_M.gguf", "Llama-3.2-3B-Instruct.IQ1_M.gguf"]
-
-    for llm in list_name_corrfm:
-        main("beers", 3, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("flights", 3, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("food", 3, ['llm_master', 'llm_correction', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("hospital", 3, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("rayyan", 3, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("tax", 3, ['llm_correction', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("bridges", 1, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("bridges", 3, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("cars", 1, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("cars", 3, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("glass", 1, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("glass", 3, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("restaurant", 1, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("restaurant", 3, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("6", 5, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("137", 5, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("151", 5, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("184", 5, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("1481", 5, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("41027", 5, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-        i = 0
-        while i < 4:
-            print("\n")
-            i += 1
-        time.sleep(60)
-
-        main("43572", 5, ['auto_instance', 'fd', 'llm_correction', 'llm_master', 'llm_transformation'], llm)
-"""
