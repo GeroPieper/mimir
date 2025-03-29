@@ -1522,7 +1522,7 @@ if __name__ == '__main__':
     clean_with_user_input = True  # Careful: If set to False, d.corrected_cells will remain empty.
     gpdep_threshold = 0.3
     training_time_limit = 90
-    feature_generators = ['auto_instance', 'fd', 'llm_master', 'llm_transformation', 'llm_correction']
+    feature_generators = ['fd', 'auto_instance', 'llm_master', 'llm_transformation', 'llm_correction']
     last_try_threshold = 0.8  # if 1.0 last_try is off, if less than 1.0 it functions as the minimum precision needed for a valid transformation, less than 0.8 isn't recommended
     llm_temp = 0.1  # temp for the llm used in llm_master, llm_transformation, llm_correction
     llm_top_k = 5  # top_k for the llm used in llm_master, llm_transformation, llm_correction
@@ -1536,7 +1536,7 @@ if __name__ == '__main__':
     vicinity_feature_generator = "naive"
     pdep_features = ['pr']
     test_synth_data_direction = 'user_data'
-    llm_name_corrfm = "Meta-Llama-3.1-8B-Instruct-Q6_K_L.gguf"  # for llm_transformation are two more llm's necessary: 'DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf' and 'Codestral-22B-v0.1-Q2_K.gguf'
+    llm_name_corrfm = "Llama-3.2-1B-Instruct-F16.gguf"  # for llm_transformation are two more llm's necessary: 'DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf' and 'Codestral-22B-v0.1-Q2_K.gguf'
     sampling_technique = 'greedy'
 
     # Set this parameter to keep runtimes low when debugging
