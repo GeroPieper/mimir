@@ -10,9 +10,8 @@ import concurrent.futures
 from itertools import combinations
 import logging
 import numpy as np
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-# from queue import Queue
-from multiprocessing import get_context, Queue
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import get_context
 
 import re
 import pandas as pd
@@ -24,13 +23,9 @@ import sklearn.feature_selection
 
 from typing import Dict, List, Tuple
 
-import time
-from datetime import timedelta
 import math
 import concurrent.futures
 from gpt4all import GPT4All
-from joblib.externals.loky.backend.queues import Queue
-from numba.core.cgutils import true_bit
 from pandas import Series
 
 import dataset
@@ -63,6 +58,8 @@ class Cleaning:
                  classification_model: str = 'ABC',
                  clean_with_user_input: bool = True,
                  feature_generators: List[str] = ['auto_instance', 'fd', 'llm_correction', 'llm_master'],
+                 top_k: int = 1,
+                 temp: float = 0.1,
                  vicinity_orders: List[int] = [1],
                  vicinity_feature_generator: str = 'naive',
                  auto_instance_cache_model: bool = False,
@@ -76,6 +73,8 @@ class Cleaning:
                  fd_feature: str = 'norm_gpdep',
                  dataset_analysis: bool = False,
                  llm_name_corrfm: str = 'Meta-Llama-3-8B-Instruct.Q4_0.gguf',
+                 model_path: str = "",
+                 use_llm_master_for_mv = False,
                  sampling_technique: str = 'baran'):
         """
         Parameters of the cleaning experiment.
@@ -112,6 +111,7 @@ class Cleaning:
         @param fd_feature: Feature used by the the fd_instance imputer to make cleaning suggestions. Choose from ('gpdep', 'pdep', 'fd').
         @param dataset_analysis: Write a detailed analysis of how Mimir cleans a a dataset to a .json file.
         @param llm_name_corrfm: Name of the OpenAI LLM model used in et_corrfm.
+        @param use_llm_master_for_mv: Toggles if llm_master should be used for missing values (value = '', no placeholder).
         @param sampling_technique: Technique used to sample row for user input.
         """
 
@@ -119,6 +119,8 @@ class Cleaning:
         self.CLEAN_WITH_USER_INPUT = clean_with_user_input
         self.SAMPLING_TECHNIQUE = sampling_technique
         self.FEATURE_GENERATORS = feature_generators
+        self.TOP_K = top_k
+        self.TEMP = temp
         self.VICINITY_ORDERS = vicinity_orders
         self.VICINITY_FEATURE_GENERATOR = vicinity_feature_generator
         self.AUTO_INSTANCE_CACHE_MODEL = auto_instance_cache_model
@@ -134,6 +136,8 @@ class Cleaning:
         self.MAX_VALUE_LENGTH = 50
         self.LABELING_BUDGET = labeling_budget
         self.LLM_NAME_CORRFM = llm_name_corrfm
+        self.MODEL_PATH = model_path
+        self.USE_LLM_MASTER_FOR_MV = use_llm_master_for_mv
         self.logger = logging.getLogger(__name__)
 
         # TODO remove unused attributes
@@ -644,15 +648,21 @@ class Cleaning:
             # Construct prompts for each detected cell
             for (row, col) in d.detected_cells:
                 old_value = d.dataframe.iloc[(row, col)]
-                if old_value != '':
-                    if helpers.fetch_cache(d.name, (row, col), 'llm_master', d.error_fraction, d.version, d.error_class,
-                                           self.LLM_NAME_CORRFM) is None:
-                        df_row_with_error = d.dataframe.iloc[row, :].copy()
-                        prompt = helpers.llm_master_prompt((row, col), df_error_free_subset, df_row_with_error)
-                        fetch_llm_master_args.append(
-                            [prompt, old_value, d.name, (row, col), 'llm_master', gpt_session, d.error_fraction,
-                             d.version, d.error_class, self.LLM_NAME_CORRFM]
-                        )
+                use_max_length: bool = False
+                if old_value == '':
+                    if self.USE_LLM_MASTER_FOR_MV:
+                        use_max_length = True
+                    else:
+                        continue
+                if helpers.fetch_cache(d.name, (row, col), 'llm_master', d.error_fraction, d.version, d.error_class,
+                                       self.LLM_NAME_CORRFM) is None:
+                    df_row_with_error = d.dataframe.iloc[row, :].copy()
+                    prompt, max_length = helpers.llm_master_prompt((row, col), df_error_free_subset, df_row_with_error)
+                    response_length = max_length if use_max_length else len(old_value)
+                    fetch_llm_master_args.append(
+                        [prompt, old_value, d.name, (row, col), 'llm_master', gpt_session, d.error_fraction,
+                         d.version, d.error_class, self.LLM_NAME_CORRFM]
+                    )
 
             self.logger.debug(
                 f'Identified {len(fetch_llm_master_args)} llm_master corrections not yet cached. Fetching...')
@@ -718,7 +728,7 @@ class Cleaning:
                         prompt = helpers.llm_correction_prompt(old_value, error_correction_pairs[col], column_name, category)
                         fetch_llm_correction_args.append(
                             [prompt, old_value, d.name, (row, col), 'llm_correction', gpt_session, d.error_fraction,
-                             d.version, d.error_class, self.LLM_NAME_CORRFM]
+                             d.version, d.error_class, self.LLM_NAME_CORRFM, self.TOP_K, self.TEMP]
                         )
 
             self.logger.debug(
@@ -758,7 +768,6 @@ class Cleaning:
 
             self.logger.debug(
                 f'Fetched {len(fetch_llm_correction_args)} llm_correction corrections and added them to the cache.')
-
 
         if 'auto_instance' in self.FEATURE_GENERATORS:
             self.logger.debug('Start training DataWig Models.')
@@ -1093,80 +1102,96 @@ class Cleaning:
 
     def find_llm(self):
         """
-        This methode asks the user which llm should be used, depending on the availabe Hardware and VRAM of the gpu, also
-        the user can decide between runtime and quality
-        @return:
+        Diese Methode fragt den Nutzer, welches LLM verwendet werden soll.
+        Dabei wird anhand der verfügbaren Hardware und dem VRAM der GPU (und der gewünschten
+        Laufzeit/Qualität) ein geeignetes Modell ausgewählt und initialisiert.
+        @return: Future-Objekt des initialisierten GPT4All-Modells oder None, wenn der Vorgang abgebrochen wird.
         """
+        # Falls VERBOSE aktiviert ist, wird ein vorgegebenes Modell mit vordefinierten Einstellungen geladen.
         if self.VERBOSE:
-            with ThreadPoolExecutor(max_workers=1) as executor:  # TODO funktioniert noch nicht wie gewünscht!
-                model_future: Future = executor.submit(
-                    lambda: GPT4All(  # TODO cuda Fehlermeldungen untersuchen / unterdrücken
-                        model_name=self.LLM_NAME_CORRFM,
-                        model_path="/home/gero/Schreibtisch/Bachelorarbeit/mimir/src/LLMs/",
-                        device='kompute',
-                        allow_download=False,
-                        verbose=True
-                    )
-                )
-                return model_future
-
-        llm_models = [
-            {"name": "Meta-Llama-3-8B-Instruct.Q4_0.gguf", "vram_gb": 4},
-            {"name": "Meta-Llama-3-8B-Instruct.Q4_0.gguf", "vram_gb": 8},
-            {"name": "mistral-7b-instruct-v0.2.Q4_0.gguf", "vram_gb": 16},
-            {"name": "mistral-7b-instruct-v0.2.Q4_0.gguf", "vram_gb": 24},
-        ]
-        gpus = GPT4All.list_gpus()
-        if not len(gpus) == 0:
-            x = 0
-            for gpu in gpus:
-                print(f"[{x}] {gpu}")
-                x += 1
-            gpu_id = input("Choose one of the shown GPU's to use for the correction: ")
-            device = gpus[int(gpu_id)]
-            vram_gb = int(input("What is the VRAM in GB of the chosen GPU (4,8,16,24)?: "))
-            suggestions = []
-            suitable_models = [model for model in llm_models if model["vram_gb"] <= vram_gb]
-            suggestions.append({
-                "gpu": device,
-                "vram": vram_gb,
-                "suggested_models": suitable_models
-            })
-            for suggestion in suggestions:
-                print(f"GPU: {suggestion['gpu']} ({suggestion['vram']:.2f} GB VRAM)")
-                if suggestion["suggested_models"]:
-                    print("  Suitable LLMs:")
-                    x = 0
-                    for model in suggestion["suggested_models"]:
-                        print(f"     [{x}]    - {model['name']} (requires {model['vram_gb']} GB VRAM)")
-                        x += 1
-
-                else:
-                    print("  No suitable LLMs found for this GPU.")
-            model_id = input("Choose a model ID: ")
-            model = llm_models[int(model_id)]
-            model_found = False
-            for entry in os.listdir("/home/gero/Schreibtisch/Bachelorarbeit/mimir/src/LLMs/"):
-                if entry == model['name']:  # Check for an exact match
-                    model_found = True
-            if not model_found:
-                allow_download = input("Should the model be downloaded? (y/n): ")
-                if allow_download == "n":
-                    return None
-                allow_download = allow_download == "y"
-        else:
-            device = 'cpu'
-            model = llm_models[0]
-
-        with ThreadPoolExecutor(max_workers=1) as executor:  # TODO funktioniert noch nicht wie gewünscht!
-            model_future: Future = executor.submit(
-                lambda: GPT4All(  # TODO cuda Fehlermeldungen untersuchen / unterdrücken
-                    model_name=model['name'],
-                    model_path="/home/gero/Schreibtisch/Bachelorarbeit/mimir/src/LLMs/",
-                    device=device,
-                    allow_download=allow_download,
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                model_future = executor.submit(
+                    GPT4All,
+                    model_name="Llama-3.2-1B-Instruct-F16.gguf",
+                    model_path=self.MODEL_PATH,
+                    device='kompute',
+                    allow_download=False,
                     verbose=False
                 )
+            return model_future
+
+        # Verfügbare Modelle definieren
+        llm_models = [
+            {"name": "Llama-3.2-1B-Instruct-F16.gguf", "vram_gb": 4},
+            {"name": "Llama-3.2-3B-Instruct.fp16.gguf", "vram_gb": 8},
+            {"name": "Meta-Llama-3.1-8B-Instruct-Q6_K_L.gguf", "vram_gb": 16}
+        ]
+
+        # Abfrage der verfügbaren GPUs
+        gpus = GPT4All.list_gpus()
+        if gpus:
+            # GPUs auflisten
+            for idx, gpu in enumerate(gpus):
+                print(f"[{idx}] {gpu}")
+            try:
+                gpu_id = int(input("Wähle eine der angezeigten GPUs für die Korrektur: "))
+                device = gpus[gpu_id]
+            except (ValueError, IndexError):
+                print("Ungültige Auswahl. Es wird die erste GPU verwendet.")
+                device = gpus[0]
+
+            try:
+                vram_gb = int(input("Wie viel VRAM (in GB) hat die ausgewählte GPU? (4, 8, 16): "))
+            except ValueError:
+                print("Ungültige Eingabe. Es wird standardmäßig 4 GB VRAM angenommen.")
+                vram_gb = 4
+
+            # Filtere Modelle, die in den VRAM passen
+            suitable_models = [model for model in llm_models if model["vram_gb"] <= vram_gb]
+            if suitable_models:
+                print(f"\nGPU: {device} ({vram_gb} GB VRAM)")
+                print("Geeignete LLMs:")
+                for idx, model in enumerate(suitable_models):
+                    print(f"  [{idx}] - {model['name']} (benötigt {model['vram_gb']} GB VRAM)")
+            else:
+                print("Keine geeigneten LLMs für diese GPU gefunden.")
+                return None
+
+            # Auswahl eines passenden Modells
+            try:
+                model_choice = int(input("Wähle die Modell-ID: "))
+                model = suitable_models[model_choice]
+            except (ValueError, IndexError):
+                print("Ungültige Modellauswahl.")
+                return None
+
+            # Prüfe, ob das Modell bereits lokal vorhanden ist
+            model_path = self.MODEL_PATH
+            model_found = any(entry == model['name'] for entry in os.listdir(model_path))
+            if not model_found:
+                download_input = input(
+                    "Das Modell wurde nicht lokal gefunden. Soll es heruntergeladen werden? (y/n): ").lower()
+                if download_input != "y":
+                    return None
+                allow_download = True
+            else:
+                allow_download = False
+
+        else:
+            # Falls keine GPUs vorhanden sind, wird die CPU verwendet
+            device = 'cpu'
+            model = llm_models[0]
+            allow_download = False
+
+        # Initialisiere das Modell asynchron
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            model_future = executor.submit(
+                GPT4All,
+                model_name=model['name'],
+                model_path=self.MODEL_PATH,
+                device=device,
+                allow_download=allow_download,
+                verbose=False
             )
         return model_future
 
@@ -1183,18 +1208,6 @@ class Cleaning:
         # This makes the sampling process deterministic.
         random.seed(random_seed)
 
-
-        """
-        Das alles in eigene Methode auslagern. Fall, dass kein modell passt, fehlt noch und logischerweise der wichtigste Schritt,
-        den Fehlern einen Komplexitätsscore zu geben. 
-        
-        Vielleich ist auch das ganze vorher abgefrage sinnlos. Vielleicht sollte man einfach nur die Größe der GraKa abfragen oder halt
-        irgendwie ermitteln und dann sogar mit mehreren LLMs arbeiten. Oder halt dann automatisch erkennen welches LLM funktioniert.
-        Aber ganz ohne UserInput ists schlecht, der sollte schon entscheiden können ob er das beste oder schnellste oder einen automatischen
-        mittelweg haben möchte
-        """
-
-
         model_future = self.find_llm()
         d = self.initialize_dataset(d)
         self.categorize_columns(d)
@@ -1209,7 +1222,10 @@ class Cleaning:
 
         self.draw_synth_error_positions(d)
 
-        model = model_future.result()
+        if model_future is None:
+            model = GPT4All("Llama-3.2-1B-Instruct-F16.gguf", model_path=self.MODEL_PATH, allow_download=False, device='kompute')
+        else:
+            model = model_future.result()
         gpt_session = helpers.GPT4AllModelSession(model)
 
         self.prepare_augmented_models(d, gpt_session, synchronous)
@@ -1218,25 +1234,27 @@ class Cleaning:
         self.binary_predict_corrections(d)
         self.clean_with_user_input(d)
 
+        gpt_session.reset_session()
+
         if self.VERBOSE:
             p, r, f = d.get_data_cleaning_evaluation(d.corrected_cells)[-3:]
             self.logger.info(
                 "Cleaning performance on {}:\nPrecision = {:.2f}\nRecall = {:.2f}\nF1 = {:.2f}\n".format(d.name, p, r,
                                                                                                         f))
+
         return d.corrected_cells
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     # store results for detailed analysis
     dataset_analysis = True
 
-    dataset_name = "flights"
-    error_class = "simple_mcar"
-    error_fraction = 3
+    dataset_name = "43572"
+    error_class = "imputer_simple_mcar"
+    error_fraction = 5
     version = 1
     n_rows = None
 
-    # TODO Parameter für lokales LLM hinzufügen
     labeling_budget = 20
     synth_tuples = 100
     synth_cleaning_threshold = 0.9
@@ -1244,9 +1262,9 @@ if __name__ == "__main__":
     clean_with_user_input = True  # Careful: If set to False, d.corrected_cells will remain empty.
     gpdep_threshold = 0.3
     training_time_limit = 90
-    #feature_generators = ['auto_instance', 'fd', 'llm_correction', 'llm_master']
-    #feature_generators = ['auto_instance', 'fd', 'llm_correction']
-    feature_generators = ['llm_correction']
+    feature_generators = ['llm_correction', 'llm_master', 'fd', 'auto_instance']
+    top_k = 1 # top_k for the llm used in llm_master and llm_correction
+    temp = 0 # temp for the llm used in llm_master and llm_correction
     classification_model = "ABC"
     fd_feature = 'norm_gpdep'
     vicinity_orders = [1]
@@ -1254,7 +1272,10 @@ if __name__ == "__main__":
     vicinity_feature_generator = "naive"
     pdep_features = ['pr']
     test_synth_data_direction = 'user_data'
-    llm_name_corrfm = "Meta-Llama-3-8B-Instruct.Q4_0.gguf"
+    llm_name_corrfm = "Llama-3.2-1B-Instruct-F16.gguf"
+    # model_path = "/path/to/models/"
+    model_path = "/home/gero/Schreibtisch/Bachelorarbeit/Bachelorarbeit2/mimir/models"
+    use_llm_master_for_mv = False  # toggles if llm_master should be used for missing values (value = '', no placeholder)
     sampling_technique = 'greedy'
 
     # Set this parameter to keep runtimes low when debugging
@@ -1263,10 +1284,10 @@ if __name__ == "__main__":
 
     logging.info(f'Initialized dataset {dataset_name}')
 
-    app = Cleaning(labeling_budget, classification_model, clean_with_user_input, feature_generators, vicinity_orders,
+    app = Cleaning(labeling_budget, classification_model, clean_with_user_input, feature_generators, top_k, temp, vicinity_orders,
                      vicinity_feature_generator, auto_instance_cache_model, n_best_pdeps, training_time_limit,
                      synth_tuples, synth_cleaning_threshold, test_synth_data_direction, pdep_features, gpdep_threshold,
-                     fd_feature, dataset_analysis, llm_name_corrfm, sampling_technique)
+                     fd_feature, dataset_analysis, llm_name_corrfm, model_path, use_llm_master_for_mv, sampling_technique)
     app.VERBOSE = True  # also switches real user correction to simulated user correction with ground truth AND user can choose which model to use
     random_seed = 0
-    correction_dictionary = app.run(data, random_seed, synchronous=True)  # When using llm_master or llm_correction 'synchronous' must be true
+    correction_dictionary = app.run(data, random_seed, synchronous=True)

@@ -17,9 +17,8 @@ import pandas as pd
 # import dotenv
 
 
-# dotenv.load_dotenv()
-# openai.api_key = os.environ.get('OPENAI_API_KEY')
-tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")   # TODO anderes Modell einsetzen
+
+tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
 model = GPT2LMHeadModel.from_pretrained("gpt2")
 
 @dataclass
@@ -167,13 +166,15 @@ class GPT4AllModelSession:
                 "You are a data cleaning machine that detects patterns to return a correction. If you do "                                                                                                                                                         
                 "not find a correction, you return the token <NULL>. You always follow the example and "
                 "return NOTHING but the correction or <NULL>.\n---\n")
-            print(f"Modell und Sitzung initialisiert. Mit {model.device}") #print zu logger Eintrag ändern
         return cls._instance
     
-    def generate_response(self, prompt, max_tokens):
-        #with model.chat_session:
-            #return self.model.generate(prompt, max_tokens=max_tokens, temp=0.2)
-        return self.model.generate(prompt, max_tokens=max_tokens, top_k=1, temp=0) # TODO Trade-Off von temp, top_k und Qualität, Laufzeit untersuchen
+    def generate_response(self, prompt: str, max_tokens: int, top_k: int, temp: float):
+        return self.model.generate(prompt, max_tokens=max_tokens, top_k=top_k, temp=temp)
+
+    @classmethod
+    def reset_session(cls):
+        cls._instance = None
+
 
 def connect_to_cache() -> sqlite3.Connection:
     """
@@ -258,15 +259,16 @@ def generate_llm_response(prompt: Union[str, None],
               version: Union[None, int] = None,
               error_class: Union[None, str] = None,
               #llm_name: str = "gpt-3.5-turbo"
-              llm_name: str = "Meta-Llama-3-8B-Instruct.Q4_0.gguf"
+              llm_name: str = "Meta-Llama-3-8B-Instruct.Q4_0.gguf",
+              top_k: int = 1,
+              temp: float = 0
               ) -> Union[LLMResultGPT4All, None]:
     """
     Generiert eine Antwort mit GPT4All.
     """
     try:
-        response = gpt_session.generate_response(prompt, len(old_value))  # ist nur eine Annäherung an die benötigten Token
+        response = gpt_session.generate_response(prompt, len(old_value), top_k, temp)  # ist nur eine Annäherung an die benötigten Token
         response_text = response.split('\n', 1)[0]
-        print(f"Error: {old_value}, Korrektur: {response_text}")
 
     except Exception as e:
         print(f"Error generating response: {e}")
@@ -282,7 +284,7 @@ def generate_llm_response(prompt: Union[str, None],
 
 def compute_token_logprobs(llm_result: LLMResultGPT4All) -> LLMResult | None:
     """
-    Berechnet die Token-Logwahrscheinlichkeiten und Top-Logwahrscheinlichkeiten für eine Antwort.
+    Berechnet/Schätzt die Token-Logwahrscheinlichkeiten und Top-Logwahrscheinlichkeiten für eine Antwort.
     """
     try:
         # Tokenize Prompt und Response
@@ -291,14 +293,13 @@ def compute_token_logprobs(llm_result: LLMResultGPT4All) -> LLMResult | None:
 
         with torch.no_grad():
             outputs = model(**inputs)
-            logits = outputs.logits[:, -response_inputs.input_ids.size(-1):, :]  # Nur relevante Logits
+            logits = outputs.logits[:, -response_inputs.input_ids.size(-1):, :]
             probs = F.softmax(logits, dim=-1)
             log_probs = torch.log(probs)
 
-        # Extrahiere Token-Logwahrscheinlichkeiten
         correction_tokens = tokenizer.convert_ids_to_tokens(response_inputs.input_ids[0])
         token_logprobs = [
-            log_probs[0, i, token_id].item() / 100000  # TODO: Skalierungsfaktor optimieren
+            log_probs[0, i, token_id].item() / 100000
             for i, token_id in enumerate(response_inputs.input_ids[0])
         ]
 
@@ -449,14 +450,7 @@ def llm_correction_prompt(old_value: str, error_correction_pairs: List[Tuple[str
               f"possible errors for this category: {map_error_types(category)}\n"
               f"examples:\n---\n")
 
-
-    """ "neuer" prompt ist schlechter als der "alte" - für später als Referenz aufheben
-    prompt = ("You are a data cleaning machine designed to detect patterns and return corrections. If no correction is "   
-              "found, respond with the token <NULL>.  Always adhere to the provided format and return ONLY the correction "
-              "or <NULL>.")
-    """
     error, correction = error_correction_pairs[0]
-    # Von 10 auf 4 gekürzt um eine schnellere Verarbeitung zu erzielen # TODO Trade-Off zwischen Länge des prompts - Zeit - Qualität untersuchen
     # dynamische Promptlänge, abhängig von der Länge des errors
     n_pairs = min(int(300 / len(error)), len(error_correction_pairs))
 
@@ -466,19 +460,21 @@ def llm_correction_prompt(old_value: str, error_correction_pairs: List[Tuple[str
 
     return prompt
 
-def llm_master_prompt(cell: Tuple[int, int], df_error_free_subset: pd.DataFrame, df_row_with_error: pd.DataFrame) -> str:
+def llm_master_prompt(cell: Tuple[int, int], df_error_free_subset: pd.DataFrame,
+                      df_row_with_error: pd.DataFrame) -> str and int:
     """
     Generate the llm_master prompt sent to the LLM.
     """
-
-    prompt = "You are a data cleaning machine that returns a correction, which is a single expression. If "\
-                "you do not find a correction, return the token <NULL>. You always follow the example.\n---\n"
+    prompt = "You are a data cleaning machine that returns a correction, which is a single expression. If " \
+             "you do not find a correction, return the token <NULL>. You always follow the example.\n---\n"
     n_pairs = min(5, len(df_error_free_subset))
     rows = random.sample(range(len(df_error_free_subset)), n_pairs)
+    max_length: int = 0
     for row in rows:
         row_as_string, correction = error_free_row_to_prompt(df_error_free_subset, row, cell[1])
+        if len(correction) > max_length: max_length = len(correction)
         prompt = prompt + row_as_string + '\n' + f'correction:{correction}' + '\n'
     final_row_as_string, _ = error_free_row_to_prompt(df_row_with_error, 0, cell[1])
     prompt = prompt + final_row_as_string + '\n' + 'correction:'
 
-    return prompt
+    return prompt, max_length
