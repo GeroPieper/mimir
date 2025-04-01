@@ -1,4 +1,14 @@
-# Mimir: A Holistic Error Correction System
+# Mimir++: An Advanced Data Repairing System
+Mimir++ is an extended version of Mimir, where the request to the OpenAI API for RD_ImpFM and ET_CorrFM is redirected to a local llama.cpp server. In addition, ET_CorrFM has been enhanced with multi-layer transformation analysis, allowing large datasets or those with many errors to be corrected by a local LLM within a practical runtime. The rest of Mimir remains unchanged. Mimir++ was developed as part of a bachelor thesis. Therefore, many thanks to Philipp for allowing me to use Mimir as a basis for my thesis and for the support! :)
+
+This variant (Variant 2) is designed for older hardware, especially GPUs that do not support CUDA, ROCm or Metal.
+
+I also exported my conda environment (environment2.yml) because the environment.yml didnt not work for me.
+
+I recommend 'Llama-3.2-1B-Instruct-F16.gguf' as the local LLM, it has amazing quality for its size and is very fast.
+
+Below is Mimir's ReadME with further installation instructions:
+
 Mimir is a state-of-the-art error correction system.
 ![Schematic view of the Mimir error correction system](notebook/img/mimir.png)
 
